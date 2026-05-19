@@ -1,6 +1,14 @@
-
-node_modules/
+# Python Environments
+venv/
+env/
 __pycache__/
-.env
+*.pyc
+
+# Data Files & Logs
+*.csv
+*.log
+*.sqlite3
+backend/data/
+
+# OS Files
 .DS_Store
-bootstrap_phase1.sh
