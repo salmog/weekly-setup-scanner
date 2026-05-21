@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MIT-Loop Production Engine</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body { background-color: #0d1117; color: #c9d1d9; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        .card { background-color: #161b22; border: 1px solid #30363d; border-radius: 8px; margin-bottom: 20px; }
+        .card-header { background-color: #21262d; border-bottom: 1px solid #30363d; font-weight: bold; }
+        .text-success { color: #3fb950 !important; }
+        .text-danger { color: #f85149 !important; }
+        .table { color: #c9d1d9; }
+        .table th, .table td { border-color: #30363d; }
+    </style>
+</head>
+<body>
+    <div class="container-fluid py-4">
+        <h2 class="mb-4"> MIT-Loop Quant Engine <span class="badge bg-secondary fs-6">Live Paper</span></h2>
+        
+        <div class="row mb-4">
+            <div class="col-md-6">
+                <div class="card p-3">
+                    <strong>Last System Scan:</strong> {{ state.last_scan }}
+                </div>
+            </div>
+            <div class="col-md-6">
+                <div class="card p-3">
+                    <strong>Market Status:</strong> {{ state.market_status }}
+                </div>
+            </div>
+        </div>
+
+        <div class="row">
+            {% for strat_name, account in state.accounts.items() %}
+            <div class="col-md-4">
+                <div class="card">
+                    <div class="card-header d-flex justify-content-between">
+                        <span>{{ strat_name }}</span>
+                        <span class="badge bg-primary">{{ account.active_orders }} Pending Orders</span>
+                    </div>
+                    <div class="card-body">
+                        <h3 class="mb-3">${{ "{:,.2f}".format(account.equity) }}</h3>
+                        <p><strong>Daily P&L:</strong> 
+                            <span class="{% if account.day_pnl >= 0 %}text-success{% else %}text-danger{% endif %}">
+                                ${{ "{:,.2f}".format(account.day_pnl) }}
+                            </span>
+                        </p>
+                        <p><strong>Buying Power:</strong> ${{ "{:,.2f}".format(account.buying_power) }}</p>
+                        
+                        <h6 class="mt-4 border-bottom pb-2 border-secondary">Open Positions</h6>
+                        <table class="table table-sm">
+                            <thead>
+                                <tr><th>Symbol</th><th>Qty</th><th>P&L</th></tr>
+                            </thead>
+                            <tbody>
+                                {% for pos in account.positions %}
+                                <tr>
+                                    <td>{{ pos.symbol }}</td>
+                                    <td>{{ pos.qty }}</td>
+                                    <td class="{% if pos.unrealized_pl|float >= 0 %}text-success{% else %}text-danger{% endif %}">
+                                        ${{ "{:,.2f}".format(pos.unrealized_pl|float) }}
+                                    </td>
+                                </tr>
+                                {% else %}
+                                <tr><td colspan="3" class="text-muted">No open positions. Cash is king.</td></tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+
+        <div class="row">
+            <div class="col-12">
+                <div class="card">
+                    <div class="card-header"> The Radar: Waiting For Pullback (Next Triggers)</div>
+                    <div class="card-body">
+                        <table class="table table-hover">
+                            <thead>
+                                <tr><th>Strategy Target</th><th>Symbol</th><th>Status</th><th>Execution Trigger</th></tr>
+                            </thead>
+                            <tbody>
+                                {% for setup in state.pending_setups %}
+                                <tr>
+                                    <td><span class="badge bg-info">{{ setup.strategy }}</span></td>
+                                    <td><strong>{{ setup.symbol }}</strong></td>
+                                    <td>{{ setup.status }}</td>
+                                    <td><code class="text-warning">{{ setup.trigger }}</code></td>
+                                </tr>
+                                {% else %}
+                                <tr><td colspan="4" class="text-muted">No active setups waiting. Scanning tonight.</td></tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>

@@ -1,0 +1,9 @@
+Project Structure
+mit-loop-live/
+
+ main.py                  # The core FastAPI and Trading Engine
+ requirements.txt         # Python dependencies
+ .env                     # Alpaca Credentials (NEVER commit this to Git)
+ templates/
+    dashboard.html       # The Web UI
+ deploy_ubuntu.sh         # Deployment script for your server
