@@ -1,15 +1,15 @@
-# Python Environments
+# Environments
 venv/
 env/
 __pycache__/
 *.pyc
 
-# Data Files & Logs
+# Data & Logs
 *.csv
 *.log
-*.sqlite3
-backend/data/
+historical_data/
+node_modules/
+.next/
 
-# OS Files
+# OS generated files
 .DS_Store
-MITLoop-2*

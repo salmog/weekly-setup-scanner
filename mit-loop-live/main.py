@@ -22,6 +22,16 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="MIT-Loop Pro Live Terminal")
+
+from fastapi.middleware.cors import CORSMiddleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 templates = Jinja2Templates(directory="templates")
 
 HISTORICAL_DATA_DIR = "/home/shay/autotrade_dev/fetch_candles_ibkr/historical_data"
@@ -230,3 +240,11 @@ async def force_scan():
 async def startup_event():
     update_account_states()
     run_daily_scan()
+
+# ==========================================
+# NEXT.JS V2 FRONTEND DATA BRIDGE
+# ==========================================
+@app.get("/api/live-state")
+async def get_live_state_json():
+    update_account_states()
+    return system_state
