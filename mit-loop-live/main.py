@@ -49,9 +49,10 @@ system_state = {
     "market_status": "Checking Hours...",
     "scanner_status": "Operational",
     "margin_limits": {"S1_BodyStrict": 0.0, "S2_WickScaled": 0.0, "S3_4H_Hybrid": 0.0},
+    "scheduled_liquidations": {"S1_BodyStrict": None, "S2_WickScaled": None, "S3_4H_Hybrid": None},
     "accounts": {},
     "pending_setups": [],
-    "recent_actions": [{"time": datetime.datetime.now().strftime("%H:%M:%S"), "message": "Live Engine Online. S3 Runner Isolation Logic Active."}]
+    "recent_actions": [{"time": datetime.datetime.now().strftime("%H:%M:%S"), "message": "Live Engine Online. Auto-Flatten Systems Armed."}]
 }
 
 def log_system_action(message: str):
@@ -73,6 +74,14 @@ def toggle_ignored_ticker(symbol):
         log_system_action(f"🛑 Killswitch Activated: {symbol} execution blocked.")
     with open(IGNORED_TICKERS_FILE, "w") as f: f.write("\n".join(ignored))
 
+def execute_liquidation(strat_name: str):
+    try:
+        client = clients[strat_name]
+        client.close_all_positions(cancel_orders=True)
+        log_system_action(f"🚨 [{strat_name}] FLATTEN EXECUTED: All positions closed, all orders cancelled.")
+    except Exception as e:
+        log_system_action(f"❌ Failed to flatten {strat_name}: {str(e)}")
+
 def check_market_hours():
     tz = zoneinfo.ZoneInfo("America/New_York")
     now = datetime.datetime.now(tz)
@@ -93,6 +102,18 @@ def calculate_wilders_atr(df, period=14):
 
 def update_account_states():
     check_market_hours()
+    tz = zoneinfo.ZoneInfo("America/New_York")
+    now = datetime.datetime.now(tz)
+    
+    # --- SCHEDULED AUTO-FLATTEN CHECK ---
+    for strat, sched in system_state["scheduled_liquidations"].items():
+        if sched == "OPEN" and now.hour == 9 and now.minute == 30:
+            execute_liquidation(strat)
+            system_state["scheduled_liquidations"][strat] = None
+        elif sched == "CLOSE" and now.hour == 15 and now.minute == 56:
+            execute_liquidation(strat)
+            system_state["scheduled_liquidations"][strat] = None
+
     for strat_name, client in clients.items():
         try:
             account = client.get_account()
@@ -126,6 +147,9 @@ def update_account_states():
             margin_limit = system_state["margin_limits"].get(strat_name, 0.0)
             custom_bp = max(0.0, raw_cash + margin_limit)
             effective_bp = min(custom_bp, float(account.buying_power))
+            
+            pending_entries = len([o for o in orders if o.side == OrderSide.BUY])
+            pending_exits = len([o for o in orders if o.side == OrderSide.SELL])
                 
             system_state["accounts"][strat_name] = {
                 "equity": float(account.equity),
@@ -136,15 +160,15 @@ def update_account_states():
                 "day_pnl": float(account.equity) - float(account.last_equity),
                 "margin_limit": margin_limit,
                 "positions": pos_data,
-                "active_orders": len(orders)
+                "active_orders": len(orders),
+                "pending_entries": pending_entries,
+                "pending_exits": pending_exits
             }
             
-            # --- DYNAMIC EXITS (S3 Runner Isolation ONLY) ---
             for p in pos_data:
                 sym = p["symbol"]
                 csv_d_path = os.path.join(HISTORICAL_DATA_DIR, f"{sym}_daily.csv")
                 
-                # Attach live ATR data to the UI for all strategies
                 if os.path.exists(csv_d_path):
                     df_d = pd.read_csv(csv_d_path)
                     df_d.columns = df_d.columns.str.lower()
@@ -154,7 +178,6 @@ def update_account_states():
                         p["current_atr"] = float(current_atr)
                         if p["current_price"] > 0: p["current_atr_pct"] = (float(current_atr) / float(p["current_price"])) * 100
 
-                # Strategy 3: Target and Liquidate the 50% Runner ONLY
                 csv_4h_path = os.path.join(HISTORICAL_DATA_DIR, f"{sym}_4h.csv")
                 if strat_name == "S3_4H_Hybrid" and os.path.exists(csv_4h_path):
                     df_4h = pd.read_csv(csv_4h_path)
@@ -172,15 +195,12 @@ def update_account_states():
                                 if runner_qty > 0:
                                     req = MarketOrderRequest(symbol=sym, qty=runner_qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY)
                                     client.submit_order(req)
-                                    # Attempt to clear orphaned runner stop-loss
                                     for o in pos_orders:
                                         if o.stop_price is not None and float(o.qty) == runner_qty and o.limit_price is None:
                                             client.cancel_order_by_id(o.id)
                                     log_system_action(f"📉 [S3] Trend Broke (<4H EMA20). Runner Leg ({runner_qty}x {sym}) safely liquidated.")
                             except Exception as e:
                                 pass
-                                
-                # Note: S1 and S2 have NO dynamic trailing stop. They are single-entry snipers managed by the initial -1 ATR OTO Stop-Loss.
 
         except Exception as e:
             pass
@@ -233,7 +253,6 @@ def run_daily_scan():
             if len(recent_df) < 20: continue
             current_row = recent_df.iloc[-1]
             
-            # STRATEGY 1 & 2 DETECTION
             for target_type in ["body", "wick"]:
                 strat_assigned = "Strategy 1: Body Strict" if target_type == "body" else "Strategy 2: Wick Retest"
                 setup_active = False
@@ -273,7 +292,6 @@ def run_daily_scan():
                                 "breakout_vol": float(breakout_vol), "atr": float(daily_atr)
                             })
                             
-            # STRATEGY 3 HYBRID 4H DETECTION 
             csv_4h_path = os.path.join(HISTORICAL_DATA_DIR, f"{symbol}_4h.csv")
             s3_target = float(current_row['swing_body_res'])
             
@@ -376,8 +394,6 @@ def run_daily_scan():
                         total_cost = shares * setup["target"]
                         
                         if shares >= 1 and total_cost <= local_buying_power[strat_name]:
-                            
-                            # STRATEGY 3: DUAL-LEG ENTRY
                             if strat_name == "S3_4H_Hybrid" and shares >= 2:
                                 half_shares = shares // 2
                                 runner_shares = shares - half_shares
@@ -399,7 +415,6 @@ def run_daily_scan():
                                 client.submit_order(req2)
                                 log_system_action(f"🚀 [S3] DUAL-LEG FIRED: {shares}x {setup['symbol']} @ ${setup['target']:.2f}. 2R TP Locked.")
                                 
-                            # STRATEGY 1 & 2: PURE SNIPERS (100% position, hard stop, no TP)
                             else:
                                 req = LimitOrderRequest(
                                     symbol=setup["symbol"], qty=shares, side=OrderSide.BUY, time_in_force=TimeInForce.GTC,
@@ -427,6 +442,16 @@ async def set_margin(strat_name: str, margin_amount: float = Form(...)):
     if strat_name in system_state["margin_limits"]:
         system_state["margin_limits"][strat_name] = max(0.0, margin_amount)
         log_system_action(f"⚙️ [{strat_name}] Margin allowance updated to ${margin_amount:,.2f}")
+    return RedirectResponse(url="/", status_code=303)
+
+@app.post("/schedule-liquidation/{strat_name}/{time_slot}")
+async def schedule_liquidation(strat_name: str, time_slot: str):
+    if time_slot in ["OPEN", "CLOSE"]:
+        system_state["scheduled_liquidations"][strat_name] = time_slot
+        log_system_action(f"⏱️ [{strat_name}] Scheduled Auto-Flatten for Market {time_slot}.")
+    else:
+        system_state["scheduled_liquidations"][strat_name] = None
+        log_system_action(f"⏱️ [{strat_name}] Auto-Flatten Cancelled.")
     return RedirectResponse(url="/", status_code=303)
 
 @app.get("/", response_class=HTMLResponse)
@@ -467,21 +492,13 @@ async def cancel_all_orders():
 
 @app.post("/liquidate-strategy/{strat_name}")
 async def liquidate_strategy(strat_name: str):
-    try:
-        client = clients[strat_name]
-        client.close_all_positions(cancel_orders=True)
-        log_system_action(f"🚨 [{strat_name}] STRATEGY NUKED: All positions closed, all orders cancelled.")
-    except Exception as e:
-        log_system_action(f"❌ Failed to liquidate {strat_name}: {str(e)}")
+    execute_liquidation(strat_name)
     return RedirectResponse(url="/", status_code=303)
 
 @app.post("/liquidate-all")
 async def liquidate_all():
-    for strat_name, client in clients.items():
-        try:
-            client.close_all_positions(cancel_orders=True)
-            log_system_action(f"🚨 [{strat_name}] GLOBAL LIQUIDATION: All positions and orders wiped.")
-        except Exception as e: pass
+    for strat_name in clients.keys():
+        execute_liquidation(strat_name)
     return RedirectResponse(url="/", status_code=303)
 
 @app.on_event("startup")

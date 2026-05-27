@@ -18,6 +18,44 @@
                 btn.disabled = true;
             }
         }
+
+        function updateTimer() {
+            const now = new Date();
+            const estString = now.toLocaleString("en-US", {timeZone: "America/New_York"});
+            const estTime = new Date(estString);
+            
+            const day = estTime.getDay();
+            const hours = estTime.getHours();
+            const minutes = estTime.getMinutes();
+            const seconds = estTime.getSeconds();
+            
+            let target = new Date(estTime);
+            let statusPrefix = "";
+            
+            if (day >= 1 && day <= 5 && (hours > 9 || (hours === 9 && minutes >= 30)) && hours < 16) {
+                target.setHours(16, 0, 0, 0);
+                statusPrefix = "CLOSES IN: ";
+            } else {
+                statusPrefix = "OPENS IN: ";
+                if (day === 5 && hours >= 16) { target.setDate(target.getDate() + 3); target.setHours(9, 30, 0, 0); }
+                else if (day === 6) { target.setDate(target.getDate() + 2); target.setHours(9, 30, 0, 0); }
+                else if (day === 0) { target.setDate(target.getDate() + 1); target.setHours(9, 30, 0, 0); }
+                else if (hours >= 16) { target.setDate(target.getDate() + 1); target.setHours(9, 30, 0, 0); }
+                else { target.setHours(9, 30, 0, 0); }
+            }
+            
+            const diff = target - estTime;
+            const h = Math.floor(diff / 1000 / 60 / 60);
+            const m = Math.floor((diff / 1000 / 60) % 60);
+            const s = Math.floor((diff / 1000) % 60);
+            
+            const timerEl = document.getElementById("market-timer");
+            if (timerEl) {
+                timerEl.innerText = statusPrefix + h + "h " + m + "m " + s + "s";
+            }
+        }
+        setInterval(updateTimer, 1000);
+        window.onload = updateTimer;
     </script>
     <style>
         body { background-color: #131722; color: #d1d4dc; font-family: -apple-system, BlinkMacSystemFont, "Trebuchet MS", Roboto, sans-serif; }
@@ -53,7 +91,9 @@
     <div class="tv-header d-flex justify-content-between align-items-center mb-4">
         <div class="d-flex align-items-center"><span class="tv-logo">⚡ MIT-LOOP PRO MULTI-ACCOUNT STATION</span></div>
         <div class="d-flex align-items-center gap-2">
-            <span class="status-badge {% if 'OPEN' in state.market_status %}badge-open{% else %}badge-closed{% endif %} me-2">{{ state.market_status }}</span>
+            <span class="status-badge {% if 'OPEN' in state.market_status %}badge-open{% else %}badge-closed{% endif %}">{{ state.market_status }}</span>
+            <span id="market-timer" class="badge bg-dark border border-secondary text-warning me-2" style="font-family: monospace; font-size: 0.8rem;">--:--:--</span>
+            
             <form action="/cancel-all-orders" method="POST" class="m-0" onsubmit="return confirm('WARNING: Cancel ALL waiting limit orders across ALL accounts to free up cash?');">
                 <button type="submit" class="btn btn-sm btn-outline-warning fw-bold">Clear Pending Orders</button>
             </form>
@@ -73,12 +113,16 @@
                     <h5 class="modal-title fw-bold text-danger">🚨 DANGER: GLOBAL LIQUIDATION</h5>
                     <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
                 </div>
-                <div class="modal-body text-start">
-                    <p class="text-light">This action will immediately market-sell <strong>EVERY SINGLE POSITION</strong> across <strong>ALL STRATEGIES</strong> and cancel every single resting limit order.</p>
-                    <p class="text-muted" style="font-size: 0.85rem;">To confirm you actually want to do this, type <strong>LIQUIDATE</strong> below:</p>
-                    <input type="text" id="panicInput" class="form-control bg-dark text-white border-secondary mb-3" onkeyup="validatePanic()" placeholder="Type LIQUIDATE here">
+                <div class="modal-body text-center">
+                    <p class="text-light text-start">This action will immediately market-sell <strong>EVERY SINGLE POSITION</strong> across <strong>ALL STRATEGIES</strong> and cancel every single resting limit order.</p>
+                    
+                    <h4 class="text-danger fw-bold mt-4 mb-2">YOU MUST TYPE <span class="bg-danger text-white px-2 py-1 rounded">LIQUIDATE</span> BELOW</h4>
+                    <p class="text-muted" style="font-size: 0.85rem;">To confirm you actually want to nuke your entire portfolio.</p>
+                    
+                    <input type="text" id="panicInput" class="form-control bg-dark text-white border-danger form-control-lg text-center fw-bold mb-4" onkeyup="validatePanic()" placeholder="Type LIQUIDATE here">
+                    
                     <form action="/liquidate-all" method="POST">
-                        <button type="submit" id="panicConfirmBtn" class="btn btn-danger w-100 fw-bold" disabled>NUKE EVERYTHING AT MARKET</button>
+                        <button type="submit" id="panicConfirmBtn" class="btn btn-danger btn-lg w-100 fw-bold" disabled>NUKE EVERYTHING AT MARKET</button>
                     </form>
                 </div>
             </div>
@@ -93,11 +137,45 @@
                     <div class="card-header d-flex justify-content-between align-items-center">
                         <span class="text-white">{{ strat_name }}</span>
                         <div>
-                            <form action="/liquidate-strategy/{{ strat_name }}" method="POST" class="d-inline m-0" onsubmit="return confirm('DANGER: Market Sell ALL positions and cancel all orders for {{ strat_name }}?');">
-                                <button type="submit" class="btn btn-outline-danger fw-bold py-0 px-2 me-1" style="font-size: 0.65rem;">🔥 LIQUIDATE</button>
-                            </form>
+                            <div class="dropdown d-inline m-0 me-1">
+                                <button class="btn btn-outline-danger dropdown-toggle py-0 px-2 fw-bold" type="button" data-bs-toggle="dropdown" style="font-size: 0.65rem;">
+                                    💥 FLATTEN STRATEGY: {% if state.scheduled_liquidations[strat_name] == "OPEN" %}AUTO-OPEN{% elif state.scheduled_liquidations[strat_name] == "CLOSE" %}AUTO-CLOSE (15:56){% else %}MANUAL{% endif %}
+                                </button>
+                                <ul class="dropdown-menu dropdown-menu-dark" style="font-size: 0.8rem;">
+                                    <li>
+                                        <form action="/liquidate-strategy/{{ strat_name }}" method="POST" class="m-0" onsubmit="return confirm('IMMEDIATE EXECUTION: Market sell all positions and wipe active orders for {{ strat_name }} immediately?');">
+                                            <button type="submit" class="dropdown-item text-danger fw-bold">🚨 MARKET SELL ALL NOW (Immediate)</button>
+                                        </form>
+                                    </li>
+                                    <li><hr class="dropdown-divider"></li>
+                                    <li>
+                                        <form action="/schedule-liquidation/{{ strat_name }}/OPEN" method="POST" class="m-0">
+                                            <button type="submit" class="dropdown-item {% if state.scheduled_liquidations[strat_name] == 'OPEN' %}active{% endif %}">⏱️ Queue Market Open (09:30 EST)</button>
+                                        </form>
+                                    </li>
+                                    <li>
+                                        <form action="/schedule-liquidation/{{ strat_name }}/CLOSE" method="POST" class="m-0">
+                                            <button type="submit" class="dropdown-item {% if state.scheduled_liquidations[strat_name] == 'CLOSE' %}active{% endif %}">⏱️ Queue Before Close (15:56 EST)</button>
+                                        </form>
+                                    </li>
+                                    {% if state.scheduled_liquidations[strat_name] %}
+                                    <li><hr class="dropdown-divider"></li>
+                                    <li>
+                                        <form action="/schedule-liquidation/{{ strat_name }}/OFF" method="POST" class="m-0">
+                                            <button type="submit" class="dropdown-item text-warning">❌ Cancel Pending Auto-Flatten</button>
+                                        </form>
+                                    </li>
+                                    {% endif %}
+                                </ul>
+                            </div>
+
                             <button type="button" class="btn btn-outline-info fw-bold py-0 px-2 me-2" style="font-size: 0.65rem;" data-bs-toggle="modal" data-bs-target="#modal-{{ strat_name }}">📋 SPEC SHEET</button>
-                            <span class="badge bg-dark border">{{ account.active_orders }} Orders</span>
+                            
+                            <br>
+                            <div class="text-end mt-1">
+                                <span class="badge bg-dark border border-secondary text-warning" title="Pending Entry Limit Orders">{{ account.pending_entries }} Limits</span>
+                                <span class="badge bg-dark border border-secondary text-info" title="Protective Stop-Loss & Take-Profit Orders">{{ account.pending_exits }} SL/TP</span>
+                            </div>
                         </div>
                     </div>
                     <div class="card-body">
@@ -259,12 +337,14 @@
                         <li class="list-group-item bg-transparent text-light border-secondary"><strong>Execution Entry Target:</strong> Macro Weekly Body Top (Resistance Retest Floor)</li>
                         <li class="list-group-item bg-transparent text-light border-secondary"><strong>Confirmation Filter:</strong> Price must hold strictly above floor for >4 Weeks</li>
                         <li class="list-group-item bg-transparent text-light border-secondary"><strong>Failsafe Exit:</strong> Hard Stop-Loss at Target Level - 1.0x Daily ATR</li>
+                        <li class="list-group-item bg-transparent text-light border-secondary"><strong>Dynamic Exit:</strong> None (Pure Sniper Protocol)</li>
                         <li class="list-group-item bg-transparent text-light border-secondary"><strong>Broker Routing:</strong> Single-Shot GTC Limit Order w/ OTO Bracket Stop</li>
                         
                         {% elif 'S2' in strat_name %}
                         <li class="list-group-item bg-transparent text-light border-secondary"><strong>Execution Entry Target:</strong> Macro Weekly Wick Top (Extreme Liquidity Rejection Floor)</li>
                         <li class="list-group-item bg-transparent text-light border-secondary"><strong>Confirmation Filter:</strong> Price must hold strictly above floor for >4 Weeks</li>
                         <li class="list-group-item bg-transparent text-light border-secondary"><strong>Failsafe Exit:</strong> Hard Stop-Loss at Target Level - 1.0x Daily ATR</li>
+                        <li class="list-group-item bg-transparent text-light border-secondary"><strong>Dynamic Exit:</strong> None (Pure Sniper Protocol)</li>
                         <li class="list-group-item bg-transparent text-light border-secondary"><strong>Broker Routing:</strong> Single-Shot GTC Limit Order w/ OTO Bracket Stop</li>
                         
                         {% elif 'S3' in strat_name %}
