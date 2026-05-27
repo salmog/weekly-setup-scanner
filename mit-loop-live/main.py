@@ -15,7 +15,7 @@ from fastapi.templating import Jinja2Templates
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import LimitOrderRequest, StopLossRequest, TakeProfitRequest, StopOrderRequest, MarketOrderRequest
+from alpaca.trading.requests import LimitOrderRequest, StopLossRequest, TakeProfitRequest, StopOrderRequest, MarketOrderRequest, ReplaceOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 
 from alpaca.data.historical import StockHistoricalDataClient
@@ -52,7 +52,7 @@ system_state = {
     "scheduled_liquidations": {"S1_BodyStrict": None, "S2_WickScaled": None, "S3_4H_Hybrid": None},
     "accounts": {},
     "pending_setups": [],
-    "recent_actions": [{"time": datetime.datetime.now().strftime("%H:%M:%S"), "message": "Live Engine Online. Total P&L Tracking Active."}]
+    "recent_actions": [{"time": datetime.datetime.now().strftime("%H:%M:%S"), "message": "Live Engine Online. Hybrid Manual Controls Active."}]
 }
 
 def log_system_action(message: str):
@@ -106,7 +106,7 @@ def update_account_states():
     now = datetime.datetime.now(tz)
     
     for strat, sched in system_state["scheduled_liquidations"].items():
-        if sched == "OPEN" and now.hour == 9 and now.minute == 30:
+        if sched == "OPEN" and now.hour == 9 and now.minute == 31:
             execute_liquidation(strat)
             system_state["scheduled_liquidations"][strat] = None
         elif sched == "CLOSE" and now.hour == 15 and now.minute == 56:
@@ -147,10 +147,18 @@ def update_account_states():
             custom_bp = max(0.0, raw_cash + margin_limit)
             effective_bp = min(custom_bp, float(account.buying_power))
             
-            pending_entries = len([o for o in orders if o.side == OrderSide.BUY])
-            pending_exits = len([o for o in orders if o.side == OrderSide.SELL])
+            # --- EXPOSE PENDING ENTRY LIMITS FOR UI ---
+            pending_buys = []
+            for o in orders:
+                if o.side == OrderSide.BUY:
+                    pending_buys.append({
+                        "id": o.id,
+                        "symbol": o.symbol,
+                        "qty": float(o.qty),
+                        "limit_price": float(o.limit_price) if o.limit_price else 0.0
+                    })
             
-            # --- NEW TOTAL P&L CALCULATION ---
+            pending_exits = len([o for o in orders if o.side == OrderSide.SELL])
             total_unrealized_pnl = sum([p["unrealized_pl"] for p in pos_data])
                 
             system_state["accounts"][strat_name] = {
@@ -164,7 +172,8 @@ def update_account_states():
                 "margin_limit": margin_limit,
                 "positions": pos_data,
                 "active_orders": len(orders),
-                "pending_entries": pending_entries,
+                "pending_buys": pending_buys,
+                "pending_entries": len(pending_buys),
                 "pending_exits": pending_exits
             }
             
@@ -439,6 +448,81 @@ scheduler = BackgroundScheduler()
 scheduler.add_job(update_account_states, 'interval', minutes=1)
 scheduler.add_job(run_daily_scan, 'cron', day_of_week='mon-fri', hour=16, minute=15, timezone='US/Eastern')
 scheduler.start()
+
+# --- NEW: EDIT ENTRY API ---
+@app.post("/edit-entry/{strat_name}/{symbol}")
+async def edit_entry(strat_name: str, symbol: str, new_entry: float = Form(...)):
+    client = clients[strat_name]
+    try:
+        # 1. Cancel existing buy orders
+        orders = client.get_orders()
+        for o in orders:
+            if o.symbol == symbol and o.side == OrderSide.BUY:
+                client.cancel_order_by_id(o.id)
+                
+        # 2. Get ATR to calculate 1% Risk sizing
+        csv_d_path = os.path.join(HISTORICAL_DATA_DIR, f"{symbol}_daily.csv")
+        df_d = pd.read_csv(csv_d_path)
+        df_d.columns = df_d.columns.str.lower()
+        for col in ['high', 'low', 'close']: df_d[col] = pd.to_numeric(df_d[col], errors='coerce')
+        daily_atr = float(calculate_wilders_atr(df_d, 14).iloc[-1])
+        
+        stop_loss_px = new_entry - daily_atr
+        risk_per_share = new_entry - stop_loss_px
+        
+        account = client.get_account()
+        equity = float(account.equity)
+        raw_shares = int(math.floor((equity * 0.01) / risk_per_share))
+        
+        if raw_shares >= 1:
+            if strat_name == "S3_4H_Hybrid" and raw_shares >= 2:
+                half_shares = raw_shares // 2
+                runner_shares = raw_shares - half_shares
+                tp1_px = new_entry + (2.0 * risk_per_share)
+                
+                req1 = LimitOrderRequest(
+                    symbol=symbol, qty=half_shares, side=OrderSide.BUY, time_in_force=TimeInForce.GTC,
+                    limit_price=round(new_entry, 2), order_class=OrderClass.BRACKET,
+                    take_profit=TakeProfitRequest(limit_price=round(tp1_px, 2)),
+                    stop_loss=StopLossRequest(stop_price=round(stop_loss_px, 2))
+                )
+                client.submit_order(req1)
+                
+                req2 = LimitOrderRequest(
+                    symbol=symbol, qty=runner_shares, side=OrderSide.BUY, time_in_force=TimeInForce.GTC,
+                    limit_price=round(new_entry, 2), order_class=OrderClass.OTO,
+                    stop_loss=StopLossRequest(stop_price=round(stop_loss_px, 2))
+                )
+                client.submit_order(req2)
+            else:
+                req = LimitOrderRequest(
+                    symbol=symbol, qty=raw_shares, side=OrderSide.BUY, time_in_force=TimeInForce.GTC,
+                    limit_price=round(new_entry, 2), order_class=OrderClass.OTO,
+                    stop_loss=StopLossRequest(stop_price=round(stop_loss_px, 2))
+                )
+                client.submit_order(req)
+            log_system_action(f"✏️ [{strat_name}] Entry Adjusted: {symbol} to ${new_entry:.2f}. Shares & Risk Recalculated.")
+    except Exception as e:
+        log_system_action(f"❌ Failed to edit entry for {symbol}: {str(e)}")
+    return RedirectResponse(url="/", status_code=303)
+
+# --- NEW: EDIT STOP-LOSS API ---
+@app.post("/edit-sl/{strat_name}/{symbol}")
+async def edit_sl(strat_name: str, symbol: str, new_sl: float = Form(...)):
+    client = clients[strat_name]
+    try:
+        orders = client.get_orders()
+        replaced = 0
+        for o in orders:
+            if o.symbol == symbol and o.side == OrderSide.SELL and o.stop_price is not None:
+                req = ReplaceOrderRequest(stop_price=round(new_sl, 2))
+                client.replace_order_by_id(o.id, req)
+                replaced += 1
+        if replaced > 0:
+            log_system_action(f"🛡️ [{strat_name}] Manual SL updated for {symbol} to ${new_sl:.2f}")
+    except Exception as e:
+        log_system_action(f"❌ Failed to edit SL for {symbol}: {str(e)}")
+    return RedirectResponse(url="/", status_code=303)
 
 @app.post("/set-margin/{strat_name}")
 async def set_margin(strat_name: str, margin_amount: float = Form(...)):

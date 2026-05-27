@@ -21,8 +21,10 @@
                 
                 const oldBadge = document.querySelector('.status-badge');
                 const newBadge = newDoc.querySelector('.status-badge');
-                oldBadge.className = newBadge.className;
-                oldBadge.innerText = newBadge.innerText;
+                if(oldBadge && newBadge) {
+                    oldBadge.className = newBadge.className;
+                    oldBadge.innerText = newBadge.innerText;
+                }
             } catch (e) {
                 console.error("Seamless background sync failed:", e);
             }
@@ -38,6 +40,23 @@
             }
         }
 
+        // --- NEW: DYNAMIC RISK WARNING FOR SL EDIT ---
+        function checkRisk(inputObj, entryPrice, qty, nav) {
+            const newSl = parseFloat(inputObj.value);
+            const warningEl = document.getElementById('risk-warning-' + inputObj.id);
+            if (isNaN(newSl) || !warningEl) return;
+            
+            const riskDollars = (entryPrice - newSl) * qty;
+            const maxRisk = nav * 0.01;
+            
+            if (riskDollars > maxRisk) {
+                warningEl.style.display = 'block';
+                warningEl.innerHTML = `⚠️ <b>WARNING:</b> This Stop Loss puts <b>$${riskDollars.toFixed(2)}</b> at risk (> 1.0% of NAV).`;
+            } else {
+                warningEl.style.display = 'none';
+            }
+        }
+
         function updateTimer() {
             const now = new Date();
             const estString = now.toLocaleString("en-US", {timeZone: "America/New_York"});
@@ -46,7 +65,6 @@
             const day = estTime.getDay();
             const hours = estTime.getHours();
             const minutes = estTime.getMinutes();
-            const seconds = estTime.getSeconds();
             
             let target = new Date(estTime);
             let statusPrefix = "";
@@ -90,7 +108,7 @@
         .badge-closed { background-color: rgba(120, 123, 134, 0.15); color: #787b86; border: 1px solid rgba(120, 123, 134, 0.3); }
         .terminal-box { background-color: #0c0d14; color: #b2b5be; font-family: monospace; font-size: 0.8rem; padding: 12px; height: 400px; overflow-y: auto; border: 1px solid #2a2e39; }
         .radar-scroll-container { max-height: 500px; overflow-y: auto; }
-        .btn-killswitch { background-color: rgba(239, 83, 80, 0.15); border: 1px solid #ef5350; color: #ef5350; font-size: 0.7rem; font-weight: bold; width: 100%; transition: all 0.2s;}
+        .btn-killswitch { background-color: rgba(239, 83, 80, 0.15); border: 1px solid #ef5350; color: #ef5350; font-size: 0.7rem; font-weight: bold; transition: all 0.2s;}
         .btn-killswitch:hover { background-color: #ef5350; color: #fff; }
         .live-dot { color: #00e676; font-size: 8px; vertical-align: middle; animation: blinker 2s linear infinite; margin-right: 4px; }
         @keyframes blinker { 50% { opacity: 0; } }
@@ -134,12 +152,9 @@
                 </div>
                 <div class="modal-body text-center">
                     <p class="text-light text-start">This action will immediately market-sell <strong>EVERY SINGLE POSITION</strong> across <strong>ALL STRATEGIES</strong> and cancel every single resting limit order.</p>
-                    
                     <h4 class="text-danger fw-bold mt-4 mb-2">YOU MUST TYPE <span class="bg-danger text-white px-2 py-1 rounded">LIQUIDATE</span> BELOW</h4>
                     <p class="text-muted" style="font-size: 0.85rem;">To confirm you actually want to nuke your entire portfolio.</p>
-                    
                     <input type="text" id="panicInput" class="form-control bg-dark text-white border-danger form-control-lg text-center fw-bold mb-4" onkeyup="validatePanic()" placeholder="Type LIQUIDATE here">
-                    
                     <form action="/liquidate-all" method="POST">
                         <button type="submit" id="panicConfirmBtn" class="btn btn-danger btn-lg w-100 fw-bold" disabled>NUKE EVERYTHING AT MARKET</button>
                     </form>
@@ -167,29 +182,15 @@
                                         </form>
                                     </li>
                                     <li><hr class="dropdown-divider"></li>
-                                    <li>
-                                        <form action="/schedule-liquidation/{{ strat_name }}/OPEN" method="POST" class="m-0">
-                                            <button type="submit" class="dropdown-item {% if state.scheduled_liquidations[strat_name] == 'OPEN' %}active{% endif %}">⏱️ Queue Market Open (09:30 EST)</button>
-                                        </form>
-                                    </li>
-                                    <li>
-                                        <form action="/schedule-liquidation/{{ strat_name }}/CLOSE" method="POST" class="m-0">
-                                            <button type="submit" class="dropdown-item {% if state.scheduled_liquidations[strat_name] == 'CLOSE' %}active{% endif %}">⏱️ Queue Before Close (15:56 EST)</button>
-                                        </form>
-                                    </li>
+                                    <li><form action="/schedule-liquidation/{{ strat_name }}/OPEN" method="POST" class="m-0"><button type="submit" class="dropdown-item {% if state.scheduled_liquidations[strat_name] == 'OPEN' %}active{% endif %}">⏱️ Queue Market Open (09:31 EST)</button></form></li>
+                                    <li><form action="/schedule-liquidation/{{ strat_name }}/CLOSE" method="POST" class="m-0"><button type="submit" class="dropdown-item {% if state.scheduled_liquidations[strat_name] == 'CLOSE' %}active{% endif %}">⏱️ Queue Before Close (15:56 EST)</button></form></li>
                                     {% if state.scheduled_liquidations[strat_name] %}
                                     <li><hr class="dropdown-divider"></li>
-                                    <li>
-                                        <form action="/schedule-liquidation/{{ strat_name }}/OFF" method="POST" class="m-0">
-                                            <button type="submit" class="dropdown-item text-warning">❌ Cancel Pending Auto-Flatten</button>
-                                        </form>
-                                    </li>
+                                    <li><form action="/schedule-liquidation/{{ strat_name }}/OFF" method="POST" class="m-0"><button type="submit" class="dropdown-item text-warning">❌ Cancel Pending Auto-Flatten</button></form></li>
                                     {% endif %}
                                 </ul>
                             </div>
-
                             <button type="button" class="btn btn-outline-info fw-bold py-0 px-2 me-2" style="font-size: 0.65rem;" data-bs-toggle="modal" data-bs-target="#modal-{{ strat_name }}">📋 SPEC SHEET</button>
-                            
                             <br>
                             <div class="text-end mt-1">
                                 <span class="badge bg-dark border border-secondary text-warning" title="Pending Entry Limit Orders">{{ account.pending_entries }} Limits</span>
@@ -218,18 +219,9 @@
                         </div>
                         
                         <div class="row mb-2 liquidity-box mx-0 mt-3">
-                            <div class="col-4 px-1">
-                                <div class="text-white text-uppercase mb-1" style="font-size: 0.65rem; font-weight:800; letter-spacing: 0.5px;">System BP</div>
-                                <div class="text-bp">${{ "{:,.2f}".format(account.buying_power) }}</div>
-                            </div>
-                            <div class="col-4 px-1 text-center border-start border-end border-secondary">
-                                <div class="text-white text-uppercase mb-1" style="font-size: 0.65rem; font-weight:800; letter-spacing: 0.5px;">Parked Orders</div>
-                                <div class="text-parked">${{ "{:,.2f}".format(account.tied_up_cash) }}</div>
-                            </div>
-                            <div class="col-4 px-1 text-end">
-                                <div class="text-white text-uppercase mb-1" style="font-size: 0.65rem; font-weight:800; letter-spacing: 0.5px;">Max Cash</div>
-                                <div class="text-max">${{ "{:,.2f}".format(account.cash) }}</div>
-                            </div>
+                            <div class="col-4 px-1"><div class="text-white text-uppercase mb-1" style="font-size: 0.65rem; font-weight:800;">System BP</div><div class="text-bp">${{ "{:,.2f}".format(account.buying_power) }}</div></div>
+                            <div class="col-4 px-1 text-center border-start border-end border-secondary"><div class="text-white text-uppercase mb-1" style="font-size: 0.65rem; font-weight:800;">Parked Orders</div><div class="text-parked">${{ "{:,.2f}".format(account.tied_up_cash) }}</div></div>
+                            <div class="col-4 px-1 text-end"><div class="text-white text-uppercase mb-1" style="font-size: 0.65rem; font-weight:800;">Max Cash</div><div class="text-max">${{ "{:,.2f}".format(account.cash) }}</div></div>
                         </div>
 
                         <form action="/set-margin/{{ strat_name }}" method="POST" class="d-flex mb-3 align-items-center">
@@ -241,9 +233,44 @@
                             </div>
                         </form>
 
+                        <div class="metric-label mt-3 mb-2 text-warning">Pending Entry Orders</div>
+                        <table class="table table-sm align-middle mb-4">
+                            <thead><tr><th>Asset</th><th>Target Fill Price</th><th class="text-end">Controls</th></tr></thead>
+                            <tbody>
+                                {% for order in account.pending_buys %}
+                                <tr>
+                                    <td><strong style="color: #2962ff;">{{ order.symbol }}</strong> <span class="text-muted" style="font-size: 0.75rem;">({{ order.qty }} sh)</span></td>
+                                    <td><span class="number-blue">${{ "{:.2f}".format(order.limit_price) }}</span></td>
+                                    <td class="text-end">
+                                        <button class="btn btn-sm btn-outline-warning py-0 px-2" style="font-size:0.7rem;" data-bs-toggle="modal" data-bs-target="#edit-entry-{{ strat_name }}-{{ order.symbol }}">✏️ EDIT</button>
+                                        <form action="/market-sell-all/{{ strat_name }}/{{ order.symbol }}" method="POST" class="d-inline m-0" onsubmit="return confirm('Cancel limit order for {{ order.symbol }}?');"><button type="submit" class="btn btn-sm btn-killswitch py-0 px-2">CANCEL</button></form>
+                                    </td>
+                                </tr>
+                                
+                                <div class="modal fade" id="edit-entry-{{ strat_name }}-{{ order.symbol }}" tabindex="-1" aria-hidden="true">
+                                    <div class="modal-dialog modal-sm">
+                                        <div class="modal-content">
+                                            <div class="modal-header"><h5 class="modal-title fw-bold text-white">✏️ Adjust Entry: {{ order.symbol }}</h5><button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button></div>
+                                            <form action="/edit-entry/{{ strat_name }}/{{ order.symbol }}" method="POST">
+                                                <div class="modal-body">
+                                                    <p class="text-muted" style="font-size:0.8rem;">Modifying this level will cancel the old limit, recalculate the ATR stop, adjust share sizing to exactly 1.0% NAV, and submit a fresh bracket.</p>
+                                                    <label class="text-light fw-bold mb-1" style="font-size:0.8rem;">New Target Limit Price ($)</label>
+                                                    <input type="number" step="0.01" name="new_entry" class="form-control bg-dark text-white border-primary fw-bold" value="{{ order.limit_price }}" required>
+                                                </div>
+                                                <div class="modal-footer"><button type="submit" class="btn btn-primary w-100 fw-bold">Recalculate & Route Order</button></div>
+                                            </form>
+                                        </div>
+                                    </div>
+                                </div>
+                                {% else %}
+                                <tr><td colspan="3" class="text-muted text-center py-2" style="font-size:0.8rem;">No limits parked on the exchange.</td></tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+
                         <div class="metric-label mt-3 mb-2">Live Positions Ledger</div>
                         <table class="table table-sm align-middle mb-0">
-                            <thead><tr><th>Asset & Trades P&L</th><th>Pricing Matrix</th><th>Exit Strategy & ATR</th><th class="text-end">Controls</th></tr></thead>
+                            <thead><tr><th>Asset & P&L</th><th>Pricing Matrix</th><th>Exit Strategy & ATR</th><th class="text-end">Controls</th></tr></thead>
                             <tbody>
                                 {% for pos in account.positions %}
                                 <tr>
@@ -252,35 +279,49 @@
                                         <span class="text-muted" style="font-size: 0.75rem;">({{ pos.qty }} sh &nbsp;|&nbsp; <span style="color: #00e5ff; font-weight: 800;">${{ "{:,.2f}".format(pos.market_value) }}</span>)</span>
                                         <div style="font-size:0.7rem; margin-top: 4px;">
                                             <span class="text-muted" style="display:inline-block; width:55px;">Total:</span>
-                                            <span class="{% if pos.unrealized_pl >= 0 %}text-success{% else %}text-danger{% endif %} fw-bold">
-                                                {% if pos.unrealized_pl >= 0 %}+{% endif %}${{ "{:.2f}".format(pos.unrealized_pl) }} ({% if pos.unrealized_plpc >= 0 %}+{% endif %}{{ "{:.2f}".format(pos.unrealized_plpc) }}%)
-                                            </span><br>
+                                            <span class="{% if pos.unrealized_pl >= 0 %}text-success{% else %}text-danger{% endif %} fw-bold">{% if pos.unrealized_pl >= 0 %}+{% endif %}${{ "{:.2f}".format(pos.unrealized_pl) }}</span><br>
                                             <span class="text-muted" style="display:inline-block; width:55px;">Today:</span>
-                                            <span class="{% if pos.intraday_pl >= 0 %}text-success{% else %}text-danger{% endif %} fw-bold">
-                                                {% if pos.intraday_pl >= 0 %}+{% endif %}${{ "{:.2f}".format(pos.intraday_pl) }} ({% if pos.intraday_plpc >= 0 %}+{% endif %}{{ "{:.2f}".format(pos.intraday_plpc) }}%)
-                                            </span>
+                                            <span class="{% if pos.intraday_pl >= 0 %}text-success{% else %}text-danger{% endif %} fw-bold">{% if pos.intraday_pl >= 0 %}+{% endif %}${{ "{:.2f}".format(pos.intraday_pl) }}</span>
                                         </div>
                                     </td>
                                     <td>
                                         <div style="font-size:0.7rem; color:#787b86; line-height: 1.8;">
                                             <span style="display:inline-block; width: 65px;">Entry:</span> <span class="number-blue">${{ "{:.2f}".format(pos.avg_entry) }}</span><br>
-                                            <span style="display:inline-block; width: 65px;">Prev Close:</span> <span class="number-blue">${{ "{:.2f}".format(pos.lastday_price) }}</span><br>
                                             <span style="display:inline-block; width: 65px;"><span class="live-dot">●</span>Live:</span> <span class="number-blue">${{ "{:.2f}".format(pos.current_price) }}</span>
                                         </div>
                                     </td>
                                     <td>
                                         <div style="font-size:0.7rem; color:#787b86; line-height: 1.8;">
                                             ATR: <span class="number-blue">${{ "{:.2f}".format(pos.current_atr) if pos.current_atr else "0.00" }}</span> <span class="text-muted fw-bold">({{ "{:.1f}".format(pos.current_atr_pct) if pos.current_atr_pct else "0.0" }}%)</span><br>
-                                            TP: <span class="text-success fw-bold">${{ "{:.2f}".format(pos.tp_price) if pos.tp_price else "Pending" }}</span><br>
                                             SL: <span class="text-danger fw-bold">${{ "{:.2f}".format(pos.sl_price) if pos.sl_price else "Pending" }}</span>
                                         </div>
                                     </td>
                                     <td class="text-end">
-                                        <form action="/market-sell-all/{{ strat_name }}/{{ pos.symbol }}" method="POST" class="m-0" onsubmit="return confirm('Immediately market sell all shares of {{ pos.symbol }}?');">
-                                            <button type="submit" class="btn btn-sm btn-killswitch">MARKET SELL</button>
-                                        </form>
+                                        <button class="btn btn-sm btn-outline-info py-0 px-2 d-block w-100 mb-1" style="font-size:0.7rem; font-weight:bold;" data-bs-toggle="modal" data-bs-target="#edit-sl-{{ strat_name }}-{{ pos.symbol }}">⚙️ EDIT SL</button>
+                                        <form action="/market-sell-all/{{ strat_name }}/{{ pos.symbol }}" method="POST" class="m-0" onsubmit="return confirm('Immediately market sell all shares of {{ pos.symbol }}?');"><button type="submit" class="btn btn-sm btn-killswitch">MARKET SELL</button></form>
                                     </td>
                                 </tr>
+                                
+                                <div class="modal fade" id="edit-sl-{{ strat_name }}-{{ pos.symbol }}" tabindex="-1" aria-hidden="true">
+                                    <div class="modal-dialog modal-sm">
+                                        <div class="modal-content">
+                                            <div class="modal-header"><h5 class="modal-title fw-bold text-white">⚙️ Adjust Stop: {{ pos.symbol }}</h5><button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button></div>
+                                            <form action="/edit-sl/{{ strat_name }}/{{ pos.symbol }}" method="POST">
+                                                <div class="modal-body text-start">
+                                                    <div style="font-size:0.8rem; color:#b2b5be;" class="mb-3">
+                                                        Your Entry: <strong>${{ "{:.2f}".format(pos.avg_entry) }}</strong><br>
+                                                        Current SL: <strong class="text-danger">${{ "{:.2f}".format(pos.sl_price) if pos.sl_price else "N/A" }}</strong>
+                                                    </div>
+                                                    <label class="text-light fw-bold mb-1" style="font-size:0.8rem;">New Hard Stop Price ($)</label>
+                                                    <input type="number" step="0.01" name="new_sl" id="sl-input-{{ strat_name }}-{{ pos.symbol }}" class="form-control bg-dark text-white border-info fw-bold" value="{{ pos.sl_price }}" required onkeyup="checkRisk(this, {{ pos.avg_entry }}, {{ pos.qty }}, {{ account.equity }})">
+                                                    
+                                                    <div id="risk-warning-sl-input-{{ strat_name }}-{{ pos.symbol }}" class="text-danger fw-bold mt-2" style="font-size:0.75rem; display:none;"></div>
+                                                </div>
+                                                <div class="modal-footer"><button type="submit" class="btn btn-info w-100 fw-bold">Update Working Order</button></div>
+                                            </form>
+                                        </div>
+                                    </div>
+                                </div>
                                 {% else %}
                                 <tr><td colspan="4" class="text-muted text-center py-3">No active holdings.</td></tr>
                                 {% endfor %}
@@ -309,17 +350,12 @@
                                     <td><strong class="text-primary">{{ setup.symbol }}</strong></td>
                                     <td><span class="number-blue"><span class="live-dot">●</span>${{ "{:,.2f}".format(setup.live_price) }}</span></td>
                                     <td><span class="number-blue">${{ "{:,.2f}".format(setup.target) }}</span></td>
-                                    <td>
-                                        <span class="number-blue">${{ "{:.2f}".format(setup.atr) }}</span><br>
-                                        <span class="text-muted fw-bold" style="font-size:0.7rem;">({{ "{:.1f}".format(setup.atr_pct) }}%)</span>
-                                    </td>
+                                    <td><span class="number-blue">${{ "{:.2f}".format(setup.atr) }}</span><br><span class="text-muted fw-bold" style="font-size:0.7rem;">({{ "{:.1f}".format(setup.atr_pct) }}%)</span></td>
                                     <td class="text-success fw-bold">+{{ "{:.2f}".format(setup.dist) }}%</td>
                                     <td><span class="badge bg-dark border">{{ setup.age_label }}</span></td>
                                     <td class="text-muted" style="font-size:0.8rem;">{% if setup.ignored %}<b class="text-danger">BLOCKED:</b>{% endif %} {{ setup.logic }}</td>
                                     <td class="text-end">
-                                        <form action="/toggle-ignore/{{ setup.symbol }}" method="POST" class="m-0">
-                                            <button type="submit" class="btn btn-sm {% if setup.ignored %}btn-outline-warning{% else %}btn-outline-danger{% endif %}" style="font-size: 0.7rem;">{% if setup.ignored %}ENABLE{% else %}DISABLE{% endif %}</button>
-                                        </form>
+                                        <form action="/toggle-ignore/{{ setup.symbol }}" method="POST" class="m-0"><button type="submit" class="btn btn-sm {% if setup.ignored %}btn-outline-warning{% else %}btn-outline-danger{% endif %}" style="font-size: 0.7rem;">{% if setup.ignored %}ENABLE{% else %}DISABLE{% endif %}</button></form>
                                     </td>
                                 </tr>
                                 {% endfor %}
@@ -360,25 +396,14 @@
                     </div>
                     <ul class="list-group list-group-flush" style="font-size: 0.85rem;">
                         <li class="list-group-item bg-transparent text-light border-secondary"><strong>Position Sizing Model:</strong> Fixed 1.0% NAV Risk per trade</li>
-                        
                         {% if 'S1' in strat_name %}
                         <li class="list-group-item bg-transparent text-light border-secondary"><strong>Execution Entry Target:</strong> Macro Weekly Body Top (Resistance Retest Floor)</li>
-                        <li class="list-group-item bg-transparent text-light border-secondary"><strong>Confirmation Filter:</strong> Price must hold strictly above floor for >4 Weeks</li>
                         <li class="list-group-item bg-transparent text-light border-secondary"><strong>Failsafe Exit:</strong> Hard Stop-Loss at Target Level - 1.0x Daily ATR</li>
-                        <li class="list-group-item bg-transparent text-light border-secondary"><strong>Dynamic Exit:</strong> None (Pure Sniper Protocol)</li>
-                        <li class="list-group-item bg-transparent text-light border-secondary"><strong>Broker Routing:</strong> Single-Shot GTC Limit Order w/ OTO Bracket Stop</li>
-                        
                         {% elif 'S2' in strat_name %}
                         <li class="list-group-item bg-transparent text-light border-secondary"><strong>Execution Entry Target:</strong> Macro Weekly Wick Top (Extreme Liquidity Rejection Floor)</li>
-                        <li class="list-group-item bg-transparent text-light border-secondary"><strong>Confirmation Filter:</strong> Price must hold strictly above floor for >4 Weeks</li>
                         <li class="list-group-item bg-transparent text-light border-secondary"><strong>Failsafe Exit:</strong> Hard Stop-Loss at Target Level - 1.0x Daily ATR</li>
-                        <li class="list-group-item bg-transparent text-light border-secondary"><strong>Dynamic Exit:</strong> None (Pure Sniper Protocol)</li>
-                        <li class="list-group-item bg-transparent text-light border-secondary"><strong>Broker Routing:</strong> Single-Shot GTC Limit Order w/ OTO Bracket Stop</li>
-                        
                         {% elif 'S3' in strat_name %}
                         <li class="list-group-item bg-transparent text-light border-secondary"><strong>Execution Entry Target:</strong> Macro Weekly Body Top (Resistance Retest Floor)</li>
-                        <li class="list-group-item bg-transparent text-light border-secondary"><strong>Hold Verification:</strong> Must maintain structure for >4 consecutive 4H Bars</li>
-                        <li class="list-group-item bg-transparent text-light border-secondary"><strong>Distance Constraint:</strong> Trigger strictly activates when Pullback is < 5.0%</li>
                         <li class="list-group-item bg-transparent text-info border-secondary"><strong>Pro Exit Protocol (Leg 1 - 50%):</strong> GTC Bracket with Take-Profit locked at +2R</li>
                         <li class="list-group-item bg-transparent text-info border-secondary"><strong>Pro Exit Protocol (Leg 2 - 50%):</strong> Runner position actively trailed by 4H EMA20 closure</li>
                         <li class="list-group-item bg-transparent text-light border-secondary"><strong>Failsafe Stop:</strong> OTO Bracket Hard Stop at Target Level - 1.0x Daily ATR</li>
