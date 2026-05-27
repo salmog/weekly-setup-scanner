@@ -15,7 +15,7 @@ from fastapi.templating import Jinja2Templates
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import LimitOrderRequest, StopLossRequest, TakeProfitRequest, StopOrderRequest
+from alpaca.trading.requests import LimitOrderRequest, StopLossRequest, TakeProfitRequest, StopOrderRequest, MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 
 from alpaca.data.historical import StockHistoricalDataClient
@@ -51,7 +51,7 @@ system_state = {
     "margin_limits": {"S1_BodyStrict": 0.0, "S2_WickScaled": 0.0, "S3_4H_Hybrid": 0.0},
     "accounts": {},
     "pending_setups": [],
-    "recent_actions": [{"time": datetime.datetime.now().strftime("%H:%M:%S"), "message": "Live Engine Online. Trading Hours Locked to 09:30-16:00 EST."}]
+    "recent_actions": [{"time": datetime.datetime.now().strftime("%H:%M:%S"), "message": "Live Engine Online. S3 Runner Isolation Logic Active."}]
 }
 
 def log_system_action(message: str):
@@ -79,7 +79,6 @@ def check_market_hours():
     if now.weekday() >= 5:
         system_state["market_status"] = "CLOSED (Weekend)"
         return
-    # STRICT REGULAR TRADING HOURS ONLY
     market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
     market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
     system_state["market_status"] = "OPEN (Live Session)" if market_open <= now <= market_close else "CLOSED (Off-Hours)"
@@ -140,48 +139,48 @@ def update_account_states():
                 "active_orders": len(orders)
             }
             
+            # --- DYNAMIC EXITS (S3 Runner Isolation ONLY) ---
             for p in pos_data:
                 sym = p["symbol"]
-                csv_w_path = os.path.join(HISTORICAL_DATA_DIR, f"{sym}_weekly.csv")
                 csv_d_path = os.path.join(HISTORICAL_DATA_DIR, f"{sym}_daily.csv")
-                csv_4h_path = os.path.join(HISTORICAL_DATA_DIR, f"{sym}_4h.csv")
                 
+                # Attach live ATR data to the UI for all strategies
+                if os.path.exists(csv_d_path):
+                    df_d = pd.read_csv(csv_d_path)
+                    df_d.columns = df_d.columns.str.lower()
+                    for col in ['high', 'low', 'close']: df_d[col] = pd.to_numeric(df_d[col], errors='coerce')
+                    current_atr = calculate_wilders_atr(df_d, 14).iloc[-1]
+                    if pd.notna(current_atr) and current_atr > 0:
+                        p["current_atr"] = float(current_atr)
+                        if p["current_price"] > 0: p["current_atr_pct"] = (float(current_atr) / float(p["current_price"])) * 100
+
+                # Strategy 3: Target and Liquidate the 50% Runner ONLY
+                csv_4h_path = os.path.join(HISTORICAL_DATA_DIR, f"{sym}_4h.csv")
                 if strat_name == "S3_4H_Hybrid" and os.path.exists(csv_4h_path):
                     df_4h = pd.read_csv(csv_4h_path)
                     df_4h.columns = df_4h.columns.str.lower()
                     df_4h['close'] = pd.to_numeric(df_4h['close'], errors='coerce')
                     df_4h['ema20'] = df_4h['close'].ewm(span=20, adjust=False).mean()
-                    if not df_4h.empty:
-                        if df_4h['close'].iloc[-1] < df_4h['ema20'].iloc[-1]:
+                    
+                    if not df_4h.empty and df_4h['close'].iloc[-1] < df_4h['ema20'].iloc[-1]:
+                        if system_state["market_status"] == "OPEN (Live Session)":
                             try:
-                                client.close_position(sym)
-                                log_system_action(f"📉 [S3] Trend Broke (Close < 4H EMA20). Runner {sym} closed.")
-                                continue
-                            except Exception: pass
-                
-                if strat_name != "S3_4H_Hybrid" and os.path.exists(csv_w_path) and os.path.exists(csv_d_path):
-                    df_d = pd.read_csv(csv_d_path)
-                    df_d.columns = df_d.columns.str.lower()
-                    for col in ['high', 'low', 'close']: df_d[col] = pd.to_numeric(df_d[col], errors='coerce')
-                    current_atr = calculate_wilders_atr(df_d, 14).iloc[-1]
-                    
-                    df_w = pd.read_csv(csv_w_path)
-                    df_w.columns = df_w.columns.str.lower()
-                    df_w['low'] = pd.to_numeric(df_w['low'], errors='coerce')
-                    
-                    if pd.notna(current_atr) and current_atr > 0:
-                        p["current_atr"] = float(current_atr)
-                        if p["current_price"] > 0: p["current_atr_pct"] = (float(current_atr) / float(p["current_price"])) * 100
-                    
-                        trailing_support = df_w['low'].rolling(5).min().iloc[-1]
-                        dynamic_stop = trailing_support - current_atr
-                        
-                        if not p["sl_price"] and dynamic_stop > 0:
-                            req = StopOrderRequest(
-                                symbol=sym, qty=p["qty"], side=OrderSide.SELL,
-                                time_in_force=TimeInForce.GTC, stop_price=round(dynamic_stop, 2)
-                            )
-                            client.submit_order(req)
+                                pos_orders = [o for o in orders if o.symbol == sym and o.side == OrderSide.SELL]
+                                tp_qty = sum([float(o.qty) for o in pos_orders if o.limit_price is not None])
+                                runner_qty = int(float(p["qty"]) - tp_qty)
+                                
+                                if runner_qty > 0:
+                                    req = MarketOrderRequest(symbol=sym, qty=runner_qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY)
+                                    client.submit_order(req)
+                                    # Attempt to clear orphaned runner stop-loss
+                                    for o in pos_orders:
+                                        if o.stop_price is not None and float(o.qty) == runner_qty and o.limit_price is None:
+                                            client.cancel_order_by_id(o.id)
+                                    log_system_action(f"📉 [S3] Trend Broke (<4H EMA20). Runner Leg ({runner_qty}x {sym}) safely liquidated.")
+                            except Exception as e:
+                                pass
+                                
+                # Note: S1 and S2 have NO dynamic trailing stop. They are single-entry snipers managed by the initial -1 ATR OTO Stop-Loss.
 
         except Exception as e:
             pass
@@ -378,6 +377,7 @@ def run_daily_scan():
                         
                         if shares >= 1 and total_cost <= local_buying_power[strat_name]:
                             
+                            # STRATEGY 3: DUAL-LEG ENTRY
                             if strat_name == "S3_4H_Hybrid" and shares >= 2:
                                 half_shares = shares // 2
                                 runner_shares = shares - half_shares
@@ -399,6 +399,7 @@ def run_daily_scan():
                                 client.submit_order(req2)
                                 log_system_action(f"🚀 [S3] DUAL-LEG FIRED: {shares}x {setup['symbol']} @ ${setup['target']:.2f}. 2R TP Locked.")
                                 
+                            # STRATEGY 1 & 2: PURE SNIPERS (100% position, hard stop, no TP)
                             else:
                                 req = LimitOrderRequest(
                                     symbol=setup["symbol"], qty=shares, side=OrderSide.BUY, time_in_force=TimeInForce.GTC,
