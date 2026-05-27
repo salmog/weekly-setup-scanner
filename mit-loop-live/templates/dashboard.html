@@ -5,191 +5,178 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>MIT-Loop Pro Multi-Account Workstation</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        setTimeout(function() { window.location.reload(); }, 60000); 
+        
+        function validatePanic() {
+            var input = document.getElementById('panicInput').value;
+            var btn = document.getElementById('panicConfirmBtn');
+            if(input === 'LIQUIDATE') {
+                btn.disabled = false;
+            } else {
+                btn.disabled = true;
+            }
+        }
+    </script>
     <style>
-        body { 
-            background-color: #131722; 
-            color: #d1d4dc; 
-            font-family: -apple-system, BlinkMacSystemFont, "Trebuchet MS", Roboto, sans-serif; 
-        }
-        .tv-header {
-            background-color: #1c2030;
-            border-bottom: 1px solid #2a2e39;
-            padding: 14px 24px;
-        }
-        .tv-logo {
-            font-size: 1.15rem;
-            font-weight: 800;
-            color: #2962ff;
-            letter-spacing: -0.5px;
-        }
-        .card { 
-            background-color: #131722; 
-            border: 1px solid #2a2e39; 
-            border-radius: 6px; 
-            margin-bottom: 20px;
-        }
-        .card-header { 
-            background-color: #1c2030; 
-            border-bottom: 1px solid #2a2e39; 
-            color: #ffffff;
-            font-weight: 700; 
-            font-size: 0.85rem;
-            text-transform: uppercase;
-            letter-spacing: 0.3px;
-            padding: 12px 16px;
-        }
-        .metric-label {
-            font-size: 0.7rem;
-            color: #787b86;
-            font-weight: 700;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }
-        .stat-value {
-            font-size: 1.1rem;
-            font-weight: 700;
-            color: #ffffff;
-        }
-        .text-success { color: #26a69a !important; font-weight: 700; }
-        .text-danger { color: #ef5350 !important; font-weight: 700; }
-        
+        body { background-color: #131722; color: #d1d4dc; font-family: -apple-system, BlinkMacSystemFont, "Trebuchet MS", Roboto, sans-serif; }
+        .tv-header { background-color: #1c2030; border-bottom: 1px solid #2a2e39; padding: 14px 24px; }
+        .tv-logo { font-size: 1.15rem; font-weight: 800; color: #2962ff; letter-spacing: -0.5px; }
+        .card { background-color: #131722; border: 1px solid #2a2e39; border-radius: 6px; margin-bottom: 20px; }
+        .card-header { background-color: #1c2030; border-bottom: 1px solid #2a2e39; color: #ffffff; font-weight: 700; font-size: 0.85rem; text-transform: uppercase; padding: 12px 16px; }
+        .metric-label { font-size: 0.7rem; color: #787b86; font-weight: 700; text-transform: uppercase; }
         .table { color: #d1d4dc; font-size: 0.85rem; }
-        .table th {
-            background-color: #1c2030;
-            color: #787b86;
-            font-weight: 700;
-            font-size: 0.7rem;
-            text-transform: uppercase;
-            border-bottom: 1px solid #2a2e39;
-        }
+        .table th { background-color: #1c2030; color: #787b86; font-weight: 700; font-size: 0.7rem; text-transform: uppercase; border-bottom: 1px solid #2a2e39; position: sticky; top: 0; z-index: 10;}
         .table td { border-color: #2a2e39; padding: 10px 12px; }
-        .table-hover tbody tr:hover { background-color: #1c2030; }
-        
-        .status-badge {
-            padding: 6px 12px;
-            border-radius: 4px;
-            font-weight: 700;
-            font-size: 0.7rem;
-            text-transform: uppercase;
-        }
         .badge-open { background-color: rgba(38, 166, 154, 0.15); color: #26a69a; border: 1px solid rgba(38, 166, 154, 0.3); }
         .badge-closed { background-color: rgba(120, 123, 134, 0.15); color: #787b86; border: 1px solid rgba(120, 123, 134, 0.3); }
+        .terminal-box { background-color: #0c0d14; color: #b2b5be; font-family: monospace; font-size: 0.8rem; padding: 12px; height: 400px; overflow-y: auto; border: 1px solid #2a2e39; }
+        .radar-scroll-container { max-height: 500px; overflow-y: auto; }
+        .btn-killswitch { background-color: rgba(239, 83, 80, 0.15); border: 1px solid #ef5350; color: #ef5350; font-size: 0.7rem; font-weight: bold; width: 100%; transition: all 0.2s;}
+        .btn-killswitch:hover { background-color: #ef5350; color: #fff; }
+        .live-dot { color: #00e676; font-size: 8px; vertical-align: middle; animation: blinker 2s linear infinite; margin-right: 4px; }
+        @keyframes blinker { 50% { opacity: 0; } }
         
-        .terminal-box {
-            background-color: #0c0d14;
-            color: #b2b5be;
-            font-family: "Courier New", Courier, monospace;
-            font-size: 0.8rem;
-            padding: 12px;
-            border-radius: 4px;
-            height: 250px;
-            overflow-y: auto;
-            border: 1px solid #2a2e39;
-        }
-        .terminal-line { margin-bottom: 6px; line-height: 1.4; border-bottom: 1px solid #131722; padding-bottom: 4px; }
-        .terminal-time { color: #2962ff; margin-right: 8px; font-weight: bold; }
+        .number-blue { color: #448aff !important; font-weight: 800; font-size: 0.9rem; }
+        .text-bp { color: #448aff; font-weight: 800; font-size: 0.9rem; }
+        .text-parked { color: #b388ff; font-weight: 800; font-size: 0.9rem; }
+        .text-max { color: #00e5ff; font-weight: 800; font-size: 0.9rem; }
+        .liquidity-box { background: rgba(0,0,0,0.3); padding: 12px 10px; border-radius: 6px; border: 1px solid #2a2e39;}
         
-        .btn-tv-primary {
-            background-color: #2962ff;
-            color: #ffffff;
-            font-size: 0.8rem;
-            font-weight: 700;
-            text-transform: uppercase;
-            border: none;
-            padding: 8px 16px;
-            border-radius: 4px;
-            transition: background 0.2s;
-        }
-        .btn-tv-primary:hover { background-color: #1e4bd8; color: #ffffff; }
+        .modal-content { background-color: #131722; border: 1px solid #2a2e39; color: #d1d4dc; }
+        .modal-header { border-bottom: 1px solid #2a2e39; }
+        .modal-footer { border-top: 1px solid #2a2e39; }
     </style>
 </head>
 <body>
-
     <div class="tv-header d-flex justify-content-between align-items-center mb-4">
-        <div class="d-flex align-items-center">
-            <span class="tv-logo">⚡ MIT-LOOP PRO MULTI-ACCOUNT STATION</span>
-            <span class="ms-3 border-start ps-3 border-secondary" style="font-size: 0.8rem; color: #787b86; font-weight: 600;">System Mode: Live Automation</span>
-        </div>
-        <div class="d-flex align-items-center gap-3">
-            <span class="status-badge {% if 'OPEN' in state.market_status %}badge-open{% else %}badge-closed{% endif %}">
-                Exchange State: {{ state.market_status }}
-            </span>
+        <div class="d-flex align-items-center"><span class="tv-logo">⚡ MIT-LOOP PRO MULTI-ACCOUNT STATION</span></div>
+        <div class="d-flex align-items-center gap-2">
+            <span class="status-badge {% if 'OPEN' in state.market_status %}badge-open{% else %}badge-closed{% endif %} me-2">{{ state.market_status }}</span>
+            <form action="/cancel-all-orders" method="POST" class="m-0" onsubmit="return confirm('WARNING: Cancel ALL waiting limit orders across ALL accounts to free up cash?');">
+                <button type="submit" class="btn btn-sm btn-outline-warning fw-bold">Clear Pending Orders</button>
+            </form>
+            <button type="button" class="btn btn-sm btn-outline-danger fw-bold" data-bs-toggle="modal" data-bs-target="#globalPanicModal">
+                Panic Liquidate All
+            </button>
             <form action="/scan" method="POST" class="m-0">
-                <button type="submit" class="btn btn-tv-primary">Force Manual Pipeline Scan</button>
+                <button type="submit" class="btn btn-sm btn-primary fw-bold">Force Pipeline Scan</button>
             </form>
         </div>
     </div>
 
-    <div class="container-fluid px-4">
-        
-        <div class="row mb-1">
-            <div class="col-md-3">
-                <div class="card p-3">
-                    <div class="metric-label">Engine Scan State</div>
-                    <div class="stat-value text-success" style="font-size: 1rem; margin-top: 4px;">● {{ state.scanner_status }}</div>
+    <div class="modal fade" id="globalPanicModal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header border-danger">
+                    <h5 class="modal-title fw-bold text-danger">🚨 DANGER: GLOBAL LIQUIDATION</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
                 </div>
-            </div>
-            <div class="col-md-3">
-                <div class="card p-3">
-                    <div class="metric-label">Model Target Validation</div>
-                    <div class="stat-value" style="font-size: 1rem; margin-top: 4px;">&gt;= 4 Candles Above Breakout Base</div>
-                </div>
-            </div>
-            <div class="col-md-3">
-                <div class="card p-3">
-                    <div class="metric-label">Last Database Scan Execution</div>
-                    <div class="stat-value" style="font-size: 1rem; margin-top: 4px;">{{ state.last_scan }}</div>
-                </div>
-            </div>
-            <div class="col-md-3">
-                <div class="card p-3">
-                    <div class="metric-label">System Performance Metrics</div>
-                    <div class="stat-value text-success" style="font-size: 0.9rem; margin-top: 4px;">PF: 2.09x | Max DD: -11.5%</div>
+                <div class="modal-body text-start">
+                    <p class="text-light">This action will immediately market-sell <strong>EVERY SINGLE POSITION</strong> across <strong>ALL STRATEGIES</strong> and cancel every single resting limit order.</p>
+                    <p class="text-muted" style="font-size: 0.85rem;">To confirm you actually want to do this, type <strong>LIQUIDATE</strong> below:</p>
+                    <input type="text" id="panicInput" class="form-control bg-dark text-white border-secondary mb-3" onkeyup="validatePanic()" placeholder="Type LIQUIDATE here">
+                    <form action="/liquidate-all" method="POST">
+                        <button type="submit" id="panicConfirmBtn" class="btn btn-danger w-100 fw-bold" disabled>NUKE EVERYTHING AT MARKET</button>
+                    </form>
                 </div>
             </div>
         </div>
+    </div>
 
+    <div class="container-fluid px-4">
         <div class="row">
             {% for strat_name, account in state.accounts.items() %}
             <div class="col-md-4">
                 <div class="card">
                     <div class="card-header d-flex justify-content-between align-items-center">
-                        <span>{{ strat_name }}</span>
-                        <span class="badge" style="background-color: #1c2030; color: #787b86; border: 1px solid #2a2e39;">{{ account.active_orders }} Orders Active</span>
+                        <span class="text-white">{{ strat_name }}</span>
+                        <div>
+                            <form action="/liquidate-strategy/{{ strat_name }}" method="POST" class="d-inline m-0" onsubmit="return confirm('DANGER: Market Sell ALL positions and cancel all orders for {{ strat_name }}?');">
+                                <button type="submit" class="btn btn-outline-danger fw-bold py-0 px-2 me-1" style="font-size: 0.65rem;">🔥 LIQUIDATE</button>
+                            </form>
+                            <button type="button" class="btn btn-outline-info fw-bold py-0 px-2 me-2" style="font-size: 0.65rem;" data-bs-toggle="modal" data-bs-target="#modal-{{ strat_name }}">📋 SPEC SHEET</button>
+                            <span class="badge bg-dark border">{{ account.active_orders }} Orders</span>
+                        </div>
                     </div>
                     <div class="card-body">
-                        <div class="row mb-3">
-                            <div class="col-6">
-                                <div class="metric-label">Net Asset Value</div>
-                                <div class="fs-4 mt-1 text-white" style="font-weight: 800;">${{ "{:,.2f}".format(account.equity) }}</div>
-                            </div>
+                        <div class="row mb-2">
+                            <div class="col-6"><div class="metric-label">Net Asset Value</div><div class="fs-4 mt-1 fw-bold text-white">${{ "{:,.2f}".format(account.equity) }}</div></div>
                             <div class="col-6 text-end">
-                                <div class="metric-label">Intraday Broker Profit</div>
-                                <div class="fs-4 mt-1 {% if account.day_pnl >= 0 %}text-success{% else %}text-danger{% endif %}">
+                                <div class="metric-label">Daily Session P&L</div>
+                                <div class="fs-4 mt-1 fw-bold {% if account.day_pnl >= 0 %}text-success{% else %}text-danger{% endif %}">
                                     {% if account.day_pnl >= 0 %}+{% endif %}${{ "{:,.2f}".format(account.day_pnl) }}
                                 </div>
                             </div>
                         </div>
-                        <div class="pb-2 text-muted" style="font-size: 0.8rem; border-bottom: 1px solid #1c2030;">
-                            Available Cash Balances: <span class="text-white" style="font-weight: bold;">${{ "{:,.2f}".format(account.cash) }}</span>
-                        </div>
                         
+                        <div class="row mb-2 liquidity-box mx-0">
+                            <div class="col-4 px-1">
+                                <div class="text-white text-uppercase mb-1" style="font-size: 0.65rem; font-weight:800; letter-spacing: 0.5px;">System BP</div>
+                                <div class="text-bp">${{ "{:,.2f}".format(account.buying_power) }}</div>
+                            </div>
+                            <div class="col-4 px-1 text-center border-start border-end border-secondary">
+                                <div class="text-white text-uppercase mb-1" style="font-size: 0.65rem; font-weight:800; letter-spacing: 0.5px;">Parked Orders</div>
+                                <div class="text-parked">${{ "{:,.2f}".format(account.tied_up_cash) }}</div>
+                            </div>
+                            <div class="col-4 px-1 text-end">
+                                <div class="text-white text-uppercase mb-1" style="font-size: 0.65rem; font-weight:800; letter-spacing: 0.5px;">Max Cash</div>
+                                <div class="text-max">${{ "{:,.2f}".format(account.cash) }}</div>
+                            </div>
+                        </div>
+
+                        <form action="/set-margin/{{ strat_name }}" method="POST" class="d-flex mb-3 align-items-center">
+                            <span class="text-white" style="font-size:0.65rem; font-weight: 800; letter-spacing: 0.5px; width: 140px;">APPROVED MARGIN:</span>
+                            <div class="input-group input-group-sm">
+                                <span class="input-group-text bg-dark text-muted border-secondary">$</span>
+                                <input type="number" step="0.01" name="margin_amount" class="form-control bg-dark text-white border-secondary fw-bold" value="{{ state.accounts[strat_name].margin_limit }}">
+                                <button type="submit" class="btn btn-outline-secondary">Save</button>
+                            </div>
+                        </form>
+
                         <div class="metric-label mt-3 mb-2">Live Positions Ledger</div>
                         <table class="table table-sm align-middle mb-0">
-                            <thead>
-                                <tr><th>Ticker</th><th>Size</th><th class="text-end">Unrealized returns</th></tr>
-                            </thead>
+                            <thead><tr><th>Asset & Trades P&L</th><th>Pricing Matrix</th><th>Exit Strategy & ATR</th><th class="text-end">Controls</th></tr></thead>
                             <tbody>
                                 {% for pos in account.positions %}
                                 <tr>
-                                    <td><span style="font-weight: 700; color: #2962ff;">{{ pos.symbol }}</span></td>
-                                    <td>{{ pos.qty }}</td>
-                                    <td class="text-end {% if pos.unrealized_pl|float >= 0 %}text-success{% else %}text-danger{% endif %}">
-                                        ${{ "{:,.2f}".format(pos.unrealized_pl|float) }}
+                                    <td>
+                                        <strong style="color: #2962ff;">{{ pos.symbol }}</strong> 
+                                        <span class="text-muted" style="font-size: 0.75rem;">({{ pos.qty }} sh &nbsp;|&nbsp; <span style="color: #00e5ff; font-weight: 800;">${{ "{:,.2f}".format(pos.market_value) }}</span>)</span>
+                                        <div style="font-size:0.7rem; margin-top: 4px;">
+                                            <span class="text-muted" style="display:inline-block; width:55px;">Total:</span>
+                                            <span class="{% if pos.unrealized_pl >= 0 %}text-success{% else %}text-danger{% endif %} fw-bold">
+                                                {% if pos.unrealized_pl >= 0 %}+{% endif %}${{ "{:.2f}".format(pos.unrealized_pl) }} ({% if pos.unrealized_plpc >= 0 %}+{% endif %}{{ "{:.2f}".format(pos.unrealized_plpc) }}%)
+                                            </span><br>
+                                            <span class="text-muted" style="display:inline-block; width:55px;">Today:</span>
+                                            <span class="{% if pos.intraday_pl >= 0 %}text-success{% else %}text-danger{% endif %} fw-bold">
+                                                {% if pos.intraday_pl >= 0 %}+{% endif %}${{ "{:.2f}".format(pos.intraday_pl) }} ({% if pos.intraday_plpc >= 0 %}+{% endif %}{{ "{:.2f}".format(pos.intraday_plpc) }}%)
+                                            </span>
+                                        </div>
+                                    </td>
+                                    <td>
+                                        <div style="font-size:0.7rem; color:#787b86; line-height: 1.8;">
+                                            <span style="display:inline-block; width: 65px;">Entry:</span> <span class="number-blue">${{ "{:.2f}".format(pos.avg_entry) }}</span><br>
+                                            <span style="display:inline-block; width: 65px;">Prev Close:</span> <span class="number-blue">${{ "{:.2f}".format(pos.lastday_price) }}</span><br>
+                                            <span style="display:inline-block; width: 65px;"><span class="live-dot">●</span>Live:</span> <span class="number-blue">${{ "{:.2f}".format(pos.current_price) }}</span>
+                                        </div>
+                                    </td>
+                                    <td>
+                                        <div style="font-size:0.7rem; color:#787b86; line-height: 1.8;">
+                                            ATR: <span class="number-blue">${{ "{:.2f}".format(pos.current_atr) if pos.current_atr else "0.00" }}</span> <span class="text-muted fw-bold">({{ "{:.1f}".format(pos.current_atr_pct) if pos.current_atr_pct else "0.0" }}%)</span><br>
+                                            TP: <span class="text-success fw-bold">${{ "{:.2f}".format(pos.tp_price) if pos.tp_price else "Pending" }}</span><br>
+                                            SL: <span class="text-danger fw-bold">${{ "{:.2f}".format(pos.sl_price) if pos.sl_price else "Pending" }}</span>
+                                        </div>
+                                    </td>
+                                    <td class="text-end">
+                                        <form action="/market-sell-all/{{ strat_name }}/{{ pos.symbol }}" method="POST" class="m-0" onsubmit="return confirm('Immediately market sell all shares of {{ pos.symbol }}?');">
+                                            <button type="submit" class="btn btn-sm btn-killswitch">MARKET SELL</button>
+                                        </form>
                                     </td>
                                 </tr>
                                 {% else %}
-                                <tr><td colspan="3" class="text-muted py-3 text-center" style="font-size: 0.8rem; background-color: #0c0d14; border-radius: 4px;">No holdings held. Portfolio standing by in liquid configurations.</td></tr>
+                                <tr><td colspan="4" class="text-muted text-center py-3">No active holdings.</td></tr>
                                 {% endfor %}
                             </tbody>
                         </table>
@@ -202,53 +189,46 @@
         <div class="row mt-1">
             <div class="col-md-8">
                 <div class="card">
-                    <div class="card-header">🎯 Strategic Pullback Radar (Top 10 High-Probability Setups)</div>
-                    <div class="card-body p-0">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <span>🎯 Strategic Pullback Radar (Real-Time Distance)</span>
+                        <span class="badge bg-secondary">{{ state.pending_setups|length }} Tracked Assets</span>
+                    </div>
+                    <div class="card-body p-0 radar-scroll-container">
                         <table class="table table-hover mb-0 align-middle">
-                            <thead>
-                                <tr>
-                                    <th class="ps-3">Assigned Strategy</th>
-                                    <th>Ticker</th>
-                                    <th>Execution Entry Target</th>
-                                    <th>Distance to Target</th>
-                                    <th>Validation Age</th>
-                                    <th class="pe-3" style="width: 38%;">Algorithmic Logic Status</th>
-                                </tr>
-                            </thead>
+                            <thead><tr><th>Strategy</th><th>Ticker</th><th>Live Spot Price</th><th>Entry Floor</th><th>ATR</th><th>Distance</th><th>Age</th><th style="width: 25%;">Status</th><th class="text-end">Override</th></tr></thead>
                             <tbody>
                                 {% for setup in state.pending_setups %}
-                                <tr>
-                                    <td class="ps-3">
-                                        <span class="badge" style="background-color: rgba(41,98,255,0.12); color: #2962ff; border: 1px solid rgba(41,98,255,0.25); font-weight: bold; font-size: 0.7rem;">
-                                            {{ setup.strategy }}
-                                        </span>
-                                    </td>
-                                    <td><strong class="text-white">{{ setup.symbol }}</strong> <span class="text-muted" style="font-size: 0.7rem;">({{ setup.type }})</span></td>
-                                    <td><code style="color: #ff9800; font-weight: bold; font-size: 0.88rem;">${{ "{:,.2f}".format(setup.target) }}</code></td>
+                                <tr style="{% if setup.ignored %}opacity: 0.5;{% endif %}">
+                                    <td><span class="badge border border-primary text-primary" style="background: rgba(41,98,255,0.1);">{{ setup.strategy }}</span></td>
+                                    <td><strong class="text-primary">{{ setup.symbol }}</strong></td>
+                                    <td><span class="number-blue"><span class="live-dot">●</span>${{ "{:,.2f}".format(setup.live_price) }}</span></td>
+                                    <td><span class="number-blue">${{ "{:,.2f}".format(setup.target) }}</span></td>
                                     <td>
-                                        <span class="text-success" style="font-weight: bold;">+{{ "{:.2f}".format(setup.dist) }}% Above Trigger</span>
+                                        <span class="number-blue">${{ "{:.2f}".format(setup.atr) }}</span><br>
+                                        <span class="text-muted fw-bold" style="font-size:0.7rem;">({{ "{:.1f}".format(setup.atr_pct) }}%)</span>
                                     </td>
-                                    <td><span class="badge" style="background-color: #1c2030; color: #b2b5be; border: 1px solid #2a2e39;">{{ setup.weeks }} Weekly Candles</span></td>
-                                    <td class="pe-3 text-muted" style="font-size: 0.8rem; line-height: 1.45;">{{ setup.logic }}</td>
+                                    <td class="text-success fw-bold">+{{ "{:.2f}".format(setup.dist) }}%</td>
+                                    <td><span class="badge bg-dark border">{{ setup.age_label }}</span></td>
+                                    <td class="text-muted" style="font-size:0.8rem;">{% if setup.ignored %}<b class="text-danger">BLOCKED:</b>{% endif %} {{ setup.logic }}</td>
+                                    <td class="text-end">
+                                        <form action="/toggle-ignore/{{ setup.symbol }}" method="POST" class="m-0">
+                                            <button type="submit" class="btn btn-sm {% if setup.ignored %}btn-outline-warning{% else %}btn-outline-danger{% endif %}" style="font-size: 0.7rem;">{% if setup.ignored %}ENABLE{% else %}DISABLE{% endif %}</button>
+                                        </form>
+                                    </td>
                                 </tr>
-                                {% else %}
-                                <tr><td colspan="6" class="text-muted py-5 text-center" style="font-size: 0.85rem;">No database historical patterns currently match the 4-candle isolation criteria. Monitoring file storage...</td></tr>
                                 {% endfor %}
                             </tbody>
                         </table>
                     </div>
                 </div>
             </div>
-
             <div class="col-md-4">
                 <div class="card">
-                    <div class="card-header">💻 Automated Broker Audit & Operational Logs</div>
+                    <div class="card-header">💻 Automated Broker Logs</div>
                     <div class="card-body">
                         <div class="terminal-box">
                             {% for log in state.recent_actions %}
-                            <div class="terminal-line">
-                                <span class="terminal-time">[{{ log.time }}]</span>{{ log.message }}
-                            </div>
+                            <div class="terminal-line"><span class="terminal-time">[{{ log.time }}]</span>{{ log.message }}</div>
                             {% endfor %}
                         </div>
                     </div>
@@ -256,5 +236,50 @@
             </div>
         </div>
     </div>
+
+    {% for strat_name, account in state.accounts.items() %}
+    <div class="modal fade" id="modal-{{ strat_name }}" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title fw-bold text-white">⚙️ Engine Specification: {{ strat_name }}</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body text-start">
+                    <div class="row text-info mb-3 pb-2 border-bottom border-secondary" style="font-size: 0.8rem;">
+                        <div class="col-6 mb-1"><strong>Server Loop Frequency:</strong> 60 Seconds (Async)</div>
+                        <div class="col-6 mb-1"><strong>Trading Session:</strong> 09:30 - 16:00 EST</div>
+                        <div class="col-6"><strong>Broker API:</strong> Alpaca v2 REST</div>
+                        <div class="col-6"><strong>Margin Policy:</strong> Hard Clamp @ Approved Limit</div>
+                    </div>
+                    <ul class="list-group list-group-flush" style="font-size: 0.85rem;">
+                        <li class="list-group-item bg-transparent text-light border-secondary"><strong>Position Sizing Model:</strong> Fixed 1.0% NAV Risk per trade</li>
+                        
+                        {% if 'S1' in strat_name %}
+                        <li class="list-group-item bg-transparent text-light border-secondary"><strong>Execution Entry Target:</strong> Macro Weekly Body Top (Resistance Retest Floor)</li>
+                        <li class="list-group-item bg-transparent text-light border-secondary"><strong>Confirmation Filter:</strong> Price must hold strictly above floor for >4 Weeks</li>
+                        <li class="list-group-item bg-transparent text-light border-secondary"><strong>Failsafe Exit:</strong> Hard Stop-Loss at Target Level - 1.0x Daily ATR</li>
+                        <li class="list-group-item bg-transparent text-light border-secondary"><strong>Broker Routing:</strong> Single-Shot GTC Limit Order w/ OTO Bracket Stop</li>
+                        
+                        {% elif 'S2' in strat_name %}
+                        <li class="list-group-item bg-transparent text-light border-secondary"><strong>Execution Entry Target:</strong> Macro Weekly Wick Top (Extreme Liquidity Rejection Floor)</li>
+                        <li class="list-group-item bg-transparent text-light border-secondary"><strong>Confirmation Filter:</strong> Price must hold strictly above floor for >4 Weeks</li>
+                        <li class="list-group-item bg-transparent text-light border-secondary"><strong>Failsafe Exit:</strong> Hard Stop-Loss at Target Level - 1.0x Daily ATR</li>
+                        <li class="list-group-item bg-transparent text-light border-secondary"><strong>Broker Routing:</strong> Single-Shot GTC Limit Order w/ OTO Bracket Stop</li>
+                        
+                        {% elif 'S3' in strat_name %}
+                        <li class="list-group-item bg-transparent text-light border-secondary"><strong>Execution Entry Target:</strong> Macro Weekly Body Top (Resistance Retest Floor)</li>
+                        <li class="list-group-item bg-transparent text-light border-secondary"><strong>Hold Verification:</strong> Must maintain structure for >4 consecutive 4H Bars</li>
+                        <li class="list-group-item bg-transparent text-light border-secondary"><strong>Distance Constraint:</strong> Trigger strictly activates when Pullback is < 5.0%</li>
+                        <li class="list-group-item bg-transparent text-info border-secondary"><strong>Pro Exit Protocol (Leg 1 - 50%):</strong> GTC Bracket with Take-Profit locked at +2R</li>
+                        <li class="list-group-item bg-transparent text-info border-secondary"><strong>Pro Exit Protocol (Leg 2 - 50%):</strong> Runner position actively trailed by 4H EMA20 closure</li>
+                        <li class="list-group-item bg-transparent text-light border-secondary"><strong>Failsafe Stop:</strong> OTO Bracket Hard Stop at Target Level - 1.0x Daily ATR</li>
+                        {% endif %}
+                    </ul>
+                </div>
+            </div>
+        </div>
+    </div>
+    {% endfor %}
 </body>
 </html>

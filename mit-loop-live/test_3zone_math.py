@@ -1,0 +1,70 @@
+import os
+import pandas as pd
+import numpy as np
+
+HISTORICAL_DATA_DIR = "/home/shay/autotrade_dev/fetch_candles_ibkr/historical_data/"
+
+def calculate_wilders_atr(df, period=14):
+    df['prev_close'] = df['close'].shift(1)
+    tr1 = df['high'] - df['low']
+    tr2 = (df['high'] - df['prev_close']).abs()
+    tr3 = (df['low'] - df['prev_close']).abs()
+    df['true_range'] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    return df['true_range'].ewm(alpha=1/period, adjust=False).mean()
+
+print("==================================================================")
+print("🔍 3-ZONE MULTI-SCALED 'NET' VERIFICATION (IGNORING STRICT RULES)")
+print("==================================================================")
+
+all_files = [f for f in os.listdir(HISTORICAL_DATA_DIR) if f.endswith('_weekly.csv')]
+count = 0
+
+for file in all_files:
+    if count >= 5: break
+    try:
+        symbol = file.split('_')[0].upper()
+        csv_d_path = os.path.join(HISTORICAL_DATA_DIR, f"{symbol}_daily.csv")
+        if not os.path.exists(csv_d_path): continue
+        
+        df_d = pd.read_csv(csv_d_path)
+        df_d.columns = df_d.columns.str.lower()
+        for col in ['high', 'low', 'close']: df_d[col] = pd.to_numeric(df_d[col], errors='coerce')
+        daily_atr = calculate_wilders_atr(df_d, 14).iloc[-1]
+        
+        df_w = pd.read_csv(os.path.join(HISTORICAL_DATA_DIR, file))
+        df_w.columns = df_w.columns.str.lower()
+        for col in ['open', 'high', 'low', 'close']: df_w[col] = pd.to_numeric(df_w[col], errors='coerce').fillna(0)
+        
+        df_w['rolling_max_11'] = df_w['high'].rolling(11).max()
+        df_w['is_pivot'] = df_w['high'].shift(5) == df_w['rolling_max_11']
+        
+        # Identify the Wick Floor
+        df_w['swing_wick_res'] = np.where(df_w['is_pivot'], df_w['high'].shift(5), np.nan)
+        df_w['swing_wick_res'] = pd.Series(df_w['swing_wick_res']).ffill()
+
+        current_row = df_w.iloc[-1]
+        wick_floor = float(current_row['swing_wick_res'])
+        
+        if pd.isna(wick_floor) or wick_floor <= 0: continue
+        
+        live_close = float(current_row['close'])
+        atr = float(daily_atr)
+        
+        # --- 3-ZONE MATH BLUEPRINT ---
+        z1_px = wick_floor
+        z2_px = wick_floor - (0.5 * atr)
+        z3_px = wick_floor - (1.0 * atr)
+        master_stop = wick_floor - (2.0 * atr)
+        
+        print(f"✅ TICKER: {symbol} (Spot: ${live_close:.2f} | 14D ATR: ${atr:.2f})")
+        print(f"   ► ZONE 1 (The Touch):      ${z1_px:.2f} (35% Size)")
+        print(f"   ► ZONE 2 (The Dip):        ${z2_px:.2f} (35% Size)  [-0.5 ATR]")
+        print(f"   ► ZONE 3 (The Deep Test):  ${z3_px:.2f} (30% Size)  [-1.0 ATR]")
+        print(f"   ► MASTER STOP-LOSS:        ${master_stop:.2f}             [-2.0 ATR]")
+        print("-" * 65)
+        count += 1
+
+    except Exception as e:
+        continue
+
+print("==================================================================")
