@@ -52,7 +52,7 @@ system_state = {
     "scheduled_liquidations": {"S1_BodyStrict": None, "S2_WickScaled": None, "S3_4H_Hybrid": None},
     "accounts": {},
     "pending_setups": [],
-    "recent_actions": [{"time": datetime.datetime.now().strftime("%H:%M:%S"), "message": "Live Engine Online. Auto-Flatten Systems Armed."}]
+    "recent_actions": [{"time": datetime.datetime.now().strftime("%H:%M:%S"), "message": "Live Engine Online. Total P&L Tracking Active."}]
 }
 
 def log_system_action(message: str):
@@ -105,7 +105,6 @@ def update_account_states():
     tz = zoneinfo.ZoneInfo("America/New_York")
     now = datetime.datetime.now(tz)
     
-    # --- SCHEDULED AUTO-FLATTEN CHECK ---
     for strat, sched in system_state["scheduled_liquidations"].items():
         if sched == "OPEN" and now.hour == 9 and now.minute == 30:
             execute_liquidation(strat)
@@ -150,6 +149,9 @@ def update_account_states():
             
             pending_entries = len([o for o in orders if o.side == OrderSide.BUY])
             pending_exits = len([o for o in orders if o.side == OrderSide.SELL])
+            
+            # --- NEW TOTAL P&L CALCULATION ---
+            total_unrealized_pnl = sum([p["unrealized_pl"] for p in pos_data])
                 
             system_state["accounts"][strat_name] = {
                 "equity": float(account.equity),
@@ -158,6 +160,7 @@ def update_account_states():
                 "broker_bp": float(account.buying_power),
                 "tied_up_cash": max(0.0, float(account.cash) - float(account.buying_power)),
                 "day_pnl": float(account.equity) - float(account.last_equity),
+                "total_unrealized_pnl": total_unrealized_pnl,
                 "margin_limit": margin_limit,
                 "positions": pos_data,
                 "active_orders": len(orders),
