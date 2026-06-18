@@ -1,0 +1,1433 @@
+"""
+MIT-Loop Pro — Live Trading Terminal
+=====================================
+FastAPI-based quant trading engine routing 5 distinct strategies across
+5 paper Alpaca accounts. Built for institutional-grade visibility and control.
+
+Strategies:
+  - S1_Salmog3_Weekly  → Weekly body retest with pivot TP & trailing daily runner
+  - S2_WickScaled      → Weekly wick retest breakout (continuation)
+  - S3_4H_Hybrid       → 4H breakout-retest dual-leg with EMA20 trail
+  - S1_BodyStrict      → 1H V-Shape capitulation reversal
+  - S4_15M_Momentum    → Aggressive 15-min intraday hunter (breakout / retest / pullback)
+"""
+
+import os
+import math
+import logging
+import datetime
+import zoneinfo
+import asyncio
+import time
+from dotenv import load_dotenv
+import pandas as pd
+import numpy as np
+
+from fastapi import FastAPI, Request, Form
+from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.templating import Jinja2Templates
+from fastapi.middleware.cors import CORSMiddleware
+from apscheduler.schedulers.background import BackgroundScheduler
+
+from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import (
+    LimitOrderRequest, StopLossRequest, TakeProfitRequest,
+    MarketOrderRequest, ReplaceOrderRequest,
+)
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockLatestTradeRequest, StockBarsRequest
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+
+load_dotenv()
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+HISTORICAL_DATA_DIR = "/home/shay/autotrade_dev/fetch_candles_ibkr/historical_data/"
+IGNORED_TICKERS_FILE = "/root/MITLoop/mit-loop-live/ignored_tickers.txt"
+
+# Trigger envelope: how close to target before placing the limit order
+ENVELOPE_PCT = 0.02   # 2%
+WATCHLIST_MAX_PCT = 15.0   # show on radar up to 15% above target
+
+# Intraday (S4_15M) parameters
+S4_RISK_PCT = 0.005             # 0.5% NAV per intraday trade
+S4_ENVELOPE = 0.005             # 0.5% chase tolerance for breakout
+S4_START_HOUR = 10              # don't enter before 10:00 ET
+S4_LAST_ENTRY_HOUR = 15         # don't enter after 15:30 ET
+S4_LAST_ENTRY_MIN = 30
+S4_FORCE_FLAT_HOUR = 15         # force flat at 15:50 ET
+S4_FORCE_FLAT_MIN = 50
+S4_MIN_PRICE = 10.0             # tier-1 only
+S4_MIN_DOLLAR_VOL = 20_000_000  # $20M+ avg daily dollar volume
+S4_MIN_ATR_PCT = 0.015          # 1.5%+ daily ATR vs price
+S4_MAX_OPEN_TRADES = 5          # max concurrent intraday positions
+
+# Strategy specs (rendered in dashboard spec sheets)
+STRATEGY_SPECS = {
+    "S1_Salmog3_Weekly": {
+        "name": "Weekly Body Retest — Pivot TP & Trailing Runner",
+        "tagline": "Pure weekly trend-pullback. Buys retest of broken body resistance. Scales 50% at next pivot, trails the runner on daily pivot lows.",
+        "timeframe": "Weekly signal + Daily ATR + Daily trailing",
+        "rules": [
+            "Dominant weekly uptrend: EMA20 > SMA50 AND EMA20 sloping up",
+            "Macro bullish: weekly close > 30-week SMA",
+            "Liquid: price >= $5 AND (price * 20w avg volume) >= $5M",
+            "Breakout: weekly close > prior pivot body top, prev week close <= it",
+            "Breakout volume > 2.5x 20-week average",
+            "Price not over-extended: close <= EMA20 * 1.25 at breakout",
+            "Setup must hold >= 4 weekly closes above the breakout",
+            "Pullback bar volume < breakout volume (no panic selling)",
+        ],
+        "entry": "Limit BUY at breakout body level when live price within 2% above it",
+        "stop": "Breakout body level - 1.0 x Daily ATR",
+        "tp_leg1": "50% sold at next weekly resistance pivot above entry (or 6-month cycle high)",
+        "exit_runner": "Market-sell remaining 50% when weekly close < weekly EMA20 (trend break)",
+        "trail": "Runner SL moved up to most recent daily pivot low (zoomed-in support trailing, runs every minute)",
+        "risk": "1.0% NAV per trade",
+    },
+    "S2_WickScaled": {
+        "name": "Weekly Wick Retest Breakout",
+        "tagline": "Pullback continuation in confirmed weekly uptrends. Single-leg with hard ATR stop.",
+        "timeframe": "Weekly signal + Daily ATR",
+        "rules": [
+            "Weekly EMA20 > SMA50 AND EMA20 sloping up",
+            "Liquid: price >= $5 AND dollar-volume >= $5M",
+            "Breakout above prior wick high with volume > 2.5x 20-week avg",
+            "Price not over-extended: close <= EMA20 * 1.25",
+            "Setup must hold >= 4 weeks above breakout (else not actionable)",
+        ],
+        "entry": "Limit BUY at wick level when live price within 2% above it",
+        "stop": "Wick level - 1.0 x Daily ATR",
+        "tp_leg1": "None (no take-profit target)",
+        "exit_runner": "Stop-loss only — let it run until SL hits",
+        "trail": "Manual via UI (Edit SL button)",
+        "risk": "1.0% NAV per trade",
+    },
+    "S3_4H_Hybrid": {
+        "name": "4H Breakout-Retest Dual-Leg",
+        "tagline": "Confirmed 4H breakouts on pullback. Locks 2R on half, trails the runner on 4H EMA20 break.",
+        "timeframe": "4H signal + Weekly levels + Daily ATR",
+        "rules": [
+            "Weekly body resistance level (prior pivot body top) identified",
+            "4H closes above level and holds >= 4 bars (confirmed breakout)",
+            "4H EMA20 > EMA50 (uptrend on 4H)",
+            "Breakout bar volume > 1.2x 20-bar average",
+            "Pullback within 0-5% of breakout level",
+        ],
+        "entry": "Dual-leg limit BUY at breakout level (50% + 50%)",
+        "stop": "Breakout level - 1.0 x Daily ATR (both legs)",
+        "tp_leg1": "+2R locked in bracket order on first 50%",
+        "exit_runner": "Market-sell runner when 4H close < 4H EMA20",
+        "trail": "EMA-driven (no manual trail required)",
+        "risk": "1.0% NAV per trade",
+    },
+    "S1_BodyStrict": {
+        "name": "1H V-Shape Capitulation Reversal",
+        "tagline": "Catches sharp 15-25% flushes in market leaders via 1H exhaustion tails at macro support.",
+        "timeframe": "Weekly filter + 1H signal + Daily ATR",
+        "rules": [
+            "Stock >= 85% of 30-week SMA (not a structural breakdown)",
+            "Drawdown from 6-month weekly high: 15% to 25% (panic flush zone)",
+            "1H last candle shows exhaustion tail >= 3% of price",
+        ],
+        "entry": "Limit BUY at 1H wick low when live price within 2% above it",
+        "stop": "1H wick low - 1.0 x Daily ATR",
+        "tp_leg1": "None (no take-profit target)",
+        "exit_runner": "Stop-loss only",
+        "trail": "Manual via UI",
+        "risk": "1.0% NAV per trade",
+    },
+    "S4_15M_Momentum": {
+        "name": "15-Minute Momentum Hunter (Intraday, Aggressive)",
+        "tagline": "Three-vector intraday: breakout, retest, or VWAP pullback. Tight risk, aggressive exits, never holds overnight. No multi-confirmation — first weakness triggers exit.",
+        "timeframe": "15-min signal + Daily macro filter + Live Alpaca bars",
+        "rules": [
+            "MACRO GATE: Daily EMA20 > Daily SMA50 (no fighting daily downtrend)",
+            "Liquid: price >= $10 AND 20-day dollar volume >= $20M",
+            "Volatility: Daily ATR/Price >= 1.5% (needs movement)",
+            "TIME WINDOW: 10:00-15:30 ET only (no open/close auction noise)",
+            "Above session VWAP for all entries",
+            "Above Daily SMA50 close (daily uptrend mandatory)",
+            "Vector A — Breakout: 15m close > 30-bar high, vol > 1.5x avg, EMA9>EMA20 → MARKET BUY",
+            "Vector B — Retest: prior bar broke level, current low touches level +/- 0.3%, pullback vol < breakout vol → LIMIT BUY",
+            "Vector C — Pullback: EMA9>EMA20 8+ bars, dip to VWAP or EMA9, low >= EMA20, dry volume → LIMIT BUY",
+        ],
+        "entry": "Three vectors: Breakout (market), Retest (limit at level), Pullback (limit at VWAP/EMA9)",
+        "stop": "Breakout: entry - 1.0xATR  ·  Retest: level - 0.5xATR  ·  Pullback: EMA20 - 0.5xATR",
+        "tp_leg1": "33% sold at +1.5R or next 15m resistance pivot",
+        "exit_runner": "33% at +2.5R, final 33% trails by 15m EMA20",
+        "trail": "AGGRESSIVE CUTS — exits remaining on: bearish engulfing 15m / close < VWAP / close < EMA20 / 3 dry-volume bars without new high / lower high formed / 2hr time stop / 15:50 ET force-flat",
+        "risk": "0.5% NAV per trade (half of swing strategies — higher frequency)",
+    },
+}
+
+# Display order in dashboard (top-to-bottom, left-to-right)
+STRATEGY_ORDER = ["S1_Salmog3_Weekly", "S2_WickScaled", "S3_4H_Hybrid", "S1_BodyStrict", "S4_15M_Momentum"]
+
+# Routing: setup type label → account name
+TARGET_MAP = {
+    "S1_Salmog3_Weekly": "SALMOG3",
+    "S2_WickScaled": "WICK",
+    "S3_4H_Hybrid": "BODY_4H",
+    "S1_BodyStrict": "1H_TAIL",
+    "S4_15M_Momentum": "S4_INTRADAY",
+}
+
+# ============================================================================
+# FASTAPI APP
+# ============================================================================
+
+app = FastAPI(title="MIT-Loop Pro Live Terminal")
+app.add_middleware(
+    CORSMiddleware, allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
+)
+templates = Jinja2Templates(directory="templates")
+
+
+# ============================================================================
+# ALPACA CLIENTS
+# ============================================================================
+
+clients = {
+    "S1_Salmog3_Weekly": TradingClient(
+        os.getenv("ALPACA_API_KEY_SALMOG3"),
+        os.getenv("ALPACA_SECRET_KEY_SALMOG3"),
+        paper=True,
+    ),
+    "S2_WickScaled": TradingClient(
+        os.getenv("ALPACA_API_KEY_S2"),
+        os.getenv("ALPACA_SECRET_KEY_S2"),
+        paper=True,
+    ),
+    "S3_4H_Hybrid": TradingClient(
+        os.getenv("ALPACA_API_KEY_S3"),
+        os.getenv("ALPACA_SECRET_KEY_S3"),
+        paper=True,
+    ),
+    "S1_BodyStrict": TradingClient(
+        os.getenv("ALPACA_API_KEY_S1"),
+        os.getenv("ALPACA_SECRET_KEY_S1"),
+        paper=True,
+    ),
+    "S4_15M_Momentum": TradingClient(
+        os.getenv("ALPACA_API_KEY_S4_15M"),
+        os.getenv("ALPACA_SECRET_KEY_S4_15M"),
+        paper=True,
+    ),
+}
+
+data_client = StockHistoricalDataClient(
+    os.getenv("ALPACA_API_KEY_S1"),
+    os.getenv("ALPACA_SECRET_KEY_S1"),
+)
+
+
+# ============================================================================
+# SYSTEM STATE
+# ============================================================================
+
+system_state = {
+    "last_scan": "Never",
+    "last_scan_duration_s": 0.0,
+    "scan_count_today": 0,
+    "market_status": "Checking...",
+    "scanner_status": "Operational",
+    "margin_limits": {k: 0.0 for k in clients},
+    "scheduled_liquidations": {k: None for k in clients},
+    "accounts": {},
+    "pending_setups": [],
+    "s4_candidates": [],
+    "strategy_specs": STRATEGY_SPECS,
+    "strategy_order": STRATEGY_ORDER,
+    "recent_actions": [{
+        "time": datetime.datetime.now().strftime("%H:%M:%S"),
+        "message": "Live Engine online. 5 strategies armed (4 swing + 1 intraday).",
+    }],
+}
+
+
+# ============================================================================
+# HELPERS
+# ============================================================================
+
+def log_system_action(message: str):
+    system_state["recent_actions"].insert(0, {
+        "time": datetime.datetime.now().strftime("%H:%M:%S"),
+        "message": message,
+    })
+    if len(system_state["recent_actions"]) > 50:
+        system_state["recent_actions"].pop()
+
+
+def get_ignored_tickers():
+    if os.path.exists(IGNORED_TICKERS_FILE):
+        with open(IGNORED_TICKERS_FILE, "r") as f:
+            return set(line.strip() for line in f if line.strip())
+    return set()
+
+
+def toggle_ignored_ticker(symbol):
+    ignored = get_ignored_tickers()
+    if symbol in ignored:
+        ignored.remove(symbol)
+        log_system_action(f"Override cleared: {symbol} enabled for execution.")
+    else:
+        ignored.add(symbol)
+        log_system_action(f"Killswitch: {symbol} execution blocked.")
+    with open(IGNORED_TICKERS_FILE, "w") as f:
+        f.write("\n".join(sorted(ignored)))
+
+
+def execute_liquidation(strat_name: str):
+    try:
+        client = clients[strat_name]
+        client.close_all_positions(cancel_orders=True)
+        log_system_action(f"[{strat_name}] FLATTEN EXECUTED.")
+    except Exception as e:
+        log_system_action(f"Failed to flatten {strat_name}: {str(e)}")
+
+
+def check_market_hours():
+    tz = zoneinfo.ZoneInfo("America/New_York")
+    now = datetime.datetime.now(tz)
+    if now.weekday() >= 5:
+        system_state["market_status"] = "CLOSED (Weekend)"
+        return
+    market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
+    system_state["market_status"] = "OPEN (Live Session)" if market_open <= now <= market_close else "CLOSED (Off-Hours)"
+
+
+def calculate_wilders_atr(df, period=14):
+    df = df.copy()
+    df['prev_close'] = df['close'].shift(1)
+    tr1 = df['high'] - df['low']
+    tr2 = (df['high'] - df['prev_close']).abs()
+    tr3 = (df['low'] - df['prev_close']).abs()
+    df['true_range'] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    return df['true_range'].ewm(alpha=1/period, adjust=False).mean()
+
+
+def find_daily_pivot_lows(df_d, lookback=60):
+    """Return list of recent daily pivot lows. Used to trail the Salmog3 runner."""
+    if len(df_d) < lookback:
+        return []
+    recent = df_d.iloc[-lookback:].copy()
+    recent['rolling_min_11'] = recent['low'].rolling(11).min()
+    recent['is_pivot_low'] = recent['low'].shift(5) == recent['rolling_min_11']
+    pivots = recent['low'].shift(5).where(recent['is_pivot_low']).dropna()
+    return sorted(pivots.tolist())
+
+
+# ============================================================================
+# ACCOUNT STATE UPDATER
+# ============================================================================
+
+def update_account_states():
+    check_market_hours()
+    tz = zoneinfo.ZoneInfo("America/New_York")
+    now = datetime.datetime.now(tz)
+
+    # Scheduled liquidations
+    for strat, sched in system_state["scheduled_liquidations"].items():
+        if sched == "OPEN" and now.hour == 9 and now.minute == 31:
+            execute_liquidation(strat)
+            system_state["scheduled_liquidations"][strat] = None
+        elif sched == "CLOSE" and now.hour == 15 and now.minute == 56:
+            execute_liquidation(strat)
+            system_state["scheduled_liquidations"][strat] = None
+
+    for strat_name, client in clients.items():
+        try:
+            account = client.get_account()
+            positions = client.get_all_positions()
+            orders = client.get_orders()
+
+            pos_data = []
+            for p in positions:
+                pos_orders = [o for o in orders if o.symbol == p.symbol and o.side == OrderSide.SELL]
+                tp_price = next((float(o.limit_price) for o in pos_orders if o.limit_price), None)
+                sl_price = next((float(o.stop_price) for o in pos_orders if o.stop_price), None)
+
+                pos_data.append({
+                    "symbol": p.symbol,
+                    "qty": int(float(p.qty)),
+                    "market_value": float(p.market_value),
+                    "avg_entry": float(p.avg_entry_price),
+                    "current_price": float(p.current_price),
+                    "lastday_price": float(p.lastday_price) if p.lastday_price else float(p.current_price),
+                    "unrealized_pl": float(p.unrealized_pl),
+                    "unrealized_plpc": float(p.unrealized_plpc) * 100,
+                    "intraday_pl": float(p.unrealized_intraday_pl),
+                    "intraday_plpc": float(p.unrealized_intraday_plpc) * 100,
+                    "tp_price": tp_price,
+                    "sl_price": sl_price,
+                    "current_atr": 0.0,
+                    "current_atr_pct": 0.0,
+                })
+
+            raw_cash = float(account.cash)
+            margin_limit = system_state["margin_limits"].get(strat_name, 0.0)
+            custom_bp = max(0.0, raw_cash + margin_limit)
+            effective_bp = min(custom_bp, float(account.buying_power))
+
+            pending_buys = []
+            for o in orders:
+                if o.side == OrderSide.BUY:
+                    pending_buys.append({
+                        "id": o.id,
+                        "symbol": o.symbol,
+                        "qty": float(o.qty),
+                        "limit_price": float(o.limit_price) if o.limit_price else 0.0,
+                    })
+
+            pending_exits = len([o for o in orders if o.side == OrderSide.SELL])
+            total_unrealized_pnl = sum(p["unrealized_pl"] for p in pos_data)
+
+            system_state["accounts"][strat_name] = {
+                "equity": float(account.equity),
+                "cash": raw_cash,
+                "buying_power": effective_bp,
+                "broker_bp": float(account.buying_power),
+                "tied_up_cash": max(0.0, float(account.cash) - float(account.buying_power)),
+                "day_pnl": float(account.equity) - float(account.last_equity),
+                "total_unrealized_pnl": total_unrealized_pnl,
+                "margin_limit": margin_limit,
+                "positions": pos_data,
+                "active_orders": len(orders),
+                "pending_buys": pending_buys,
+                "pending_entries": len(pending_buys),
+                "pending_exits": pending_exits,
+            }
+
+            # Per-position ATR enrichment
+            for p in pos_data:
+                sym = p["symbol"]
+                csv_d_path = os.path.join(HISTORICAL_DATA_DIR, f"{sym}_daily.csv")
+                if os.path.exists(csv_d_path):
+                    df_d = pd.read_csv(csv_d_path)
+                    df_d.columns = df_d.columns.str.lower()
+                    for col in ['high', 'low', 'close']:
+                        df_d[col] = pd.to_numeric(df_d[col], errors='coerce')
+                    current_atr = calculate_wilders_atr(df_d, 14).iloc[-1]
+                    if pd.notna(current_atr) and current_atr > 0:
+                        p["current_atr"] = float(current_atr)
+                        if p["current_price"] > 0:
+                            p["current_atr_pct"] = (float(current_atr) / float(p["current_price"])) * 100
+
+                # === S3 4H EMA20 runner exit ===
+                if strat_name == "S3_4H_Hybrid":
+                    csv_4h_path = os.path.join(HISTORICAL_DATA_DIR, f"{sym}_4h.csv")
+                    if os.path.exists(csv_4h_path):
+                        df_4h = pd.read_csv(csv_4h_path)
+                        df_4h.columns = df_4h.columns.str.lower()
+                        df_4h['close'] = pd.to_numeric(df_4h['close'], errors='coerce')
+                        df_4h['ema20'] = df_4h['close'].ewm(span=20, adjust=False).mean()
+                        if not df_4h.empty and df_4h['close'].iloc[-1] < df_4h['ema20'].iloc[-1]:
+                            if system_state["market_status"] == "OPEN (Live Session)":
+                                try:
+                                    pos_orders = [o for o in orders if o.symbol == sym and o.side == OrderSide.SELL]
+                                    tp_qty = sum(float(o.qty) for o in pos_orders if o.limit_price is not None)
+                                    runner_qty = int(float(p["qty"]) - tp_qty)
+                                    if runner_qty > 0:
+                                        req = MarketOrderRequest(symbol=sym, qty=runner_qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY)
+                                        client.submit_order(req)
+                                        for o in pos_orders:
+                                            if o.stop_price is not None and float(o.qty) == runner_qty and o.limit_price is None:
+                                                client.cancel_order_by_id(o.id)
+                                        log_system_action(f"[S3] Trend break (<4H EMA20). Runner {runner_qty}x {sym} liquidated.")
+                                except Exception:
+                                    pass
+
+                # === Salmog3 Weekly EMA20 runner exit + daily pivot SL trailing ===
+                if strat_name == "S1_Salmog3_Weekly":
+                    csv_w_path = os.path.join(HISTORICAL_DATA_DIR, f"{sym}_weekly.csv")
+                    if os.path.exists(csv_w_path):
+                        df_w = pd.read_csv(csv_w_path)
+                        df_w.columns = df_w.columns.str.lower()
+                        df_w['close'] = pd.to_numeric(df_w['close'], errors='coerce')
+                        df_w['ema20'] = df_w['close'].ewm(span=20, adjust=False).mean()
+                        # Trend break: weekly close < weekly EMA20
+                        if not df_w.empty and df_w['close'].iloc[-1] < df_w['ema20'].iloc[-1]:
+                            if system_state["market_status"] == "OPEN (Live Session)":
+                                try:
+                                    pos_orders = [o for o in orders if o.symbol == sym and o.side == OrderSide.SELL]
+                                    tp_qty = sum(float(o.qty) for o in pos_orders if o.limit_price is not None)
+                                    runner_qty = int(float(p["qty"]) - tp_qty)
+                                    if runner_qty > 0:
+                                        req = MarketOrderRequest(symbol=sym, qty=runner_qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY)
+                                        client.submit_order(req)
+                                        for o in pos_orders:
+                                            if o.stop_price is not None and float(o.qty) == runner_qty and o.limit_price is None:
+                                                client.cancel_order_by_id(o.id)
+                                        log_system_action(f"[Salmog3] Weekly trend break (<EMA20). Runner {runner_qty}x {sym} liquidated.")
+                                except Exception:
+                                    pass
+
+                    # Daily pivot SL trailing for runner
+                    if os.path.exists(csv_d_path):
+                        df_d_full = pd.read_csv(csv_d_path)
+                        df_d_full.columns = df_d_full.columns.str.lower()
+                        for col in ['open', 'high', 'low', 'close']:
+                            df_d_full[col] = pd.to_numeric(df_d_full[col], errors='coerce').fillna(0)
+                        daily_pivots = find_daily_pivot_lows(df_d_full)
+                        # Most recent pivot low ABOVE current SL → new SL candidate
+                        if daily_pivots and p["sl_price"]:
+                            current_sl = p["sl_price"]
+                            candidates = [pv for pv in daily_pivots if pv > current_sl and pv < p["current_price"]]
+                            if candidates:
+                                new_sl = max(candidates)
+                                # Only update if the change is > 0.5% of price (avoid micro updates)
+                                if new_sl > current_sl * 1.005:
+                                    try:
+                                        runner_sl_orders = [o for o in orders if o.symbol == sym and o.side == OrderSide.SELL and o.stop_price is not None and o.limit_price is None]
+                                        for o in runner_sl_orders:
+                                            req = ReplaceOrderRequest(stop_price=round(new_sl, 2))
+                                            client.replace_order_by_id(o.id, req)
+                                        log_system_action(f"[Salmog3] Trail SL on {sym}: ${current_sl:.2f} → ${new_sl:.2f} (daily pivot low)")
+                                    except Exception:
+                                        pass
+
+        except Exception as e:
+            pass
+
+
+# ============================================================================
+# SCAN: full daily pipeline
+# ============================================================================
+
+def find_next_pivot_above(df_w, body_level):
+    """Find next weekly resistance pivot above body_level (for Salmog3 TP1)."""
+    if 'is_pivot' not in df_w.columns:
+        return None
+    pivot_highs = df_w[df_w['is_pivot']]['high']
+    above = pivot_highs[pivot_highs > body_level * 1.05]   # at least 5% above entry
+    if not above.empty:
+        return float(above.max())
+    # Fallback: 6-month cycle high
+    cycle_high = df_w['high'].iloc[-26:].max()
+    if cycle_high > body_level * 1.05:
+        return float(cycle_high)
+    return None
+
+
+def run_daily_scan():
+    scan_start = time.time()
+    system_state["scanner_status"] = "Scanning..."
+    update_account_states()
+    ignored_tickers = get_ignored_tickers()
+
+    if not os.path.exists(HISTORICAL_DATA_DIR):
+        system_state["scanner_status"] = "ERROR: Historical data dir missing."
+        return
+
+    all_files = [f for f in os.listdir(HISTORICAL_DATA_DIR) if f.endswith('_weekly.csv')]
+    system_state["last_scan"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    system_state["scan_count_today"] = system_state.get("scan_count_today", 0) + 1
+
+    prelim_setups = []
+
+    for file in all_files:
+        try:
+            symbol = file.split('_')[0].upper()
+            csv_d_path = os.path.join(HISTORICAL_DATA_DIR, f"{symbol}_daily.csv")
+            if not os.path.exists(csv_d_path):
+                continue
+
+            df_d = pd.read_csv(csv_d_path)
+            df_d.columns = df_d.columns.str.lower()
+            for col in ['high', 'low', 'close']:
+                df_d[col] = pd.to_numeric(df_d[col], errors='coerce')
+            daily_atr = calculate_wilders_atr(df_d, 14).iloc[-1]
+            if pd.isna(daily_atr) or daily_atr <= 0:
+                continue
+
+            df_w = pd.read_csv(os.path.join(HISTORICAL_DATA_DIR, file))
+            df_w.columns = df_w.columns.str.lower()
+            if len(df_w) < 60:
+                continue
+
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                if col in df_w.columns:
+                    df_w[col] = pd.to_numeric(df_w[col], errors='coerce').fillna(0)
+
+            df_w['ema20'] = df_w['close'].ewm(span=20, adjust=False).mean()
+            df_w['sma30'] = df_w['close'].rolling(30).mean()
+            df_w['sma50'] = df_w['close'].rolling(50).mean()
+            df_w['vol_avg'] = df_w['volume'].rolling(20).mean()
+            df_w['rolling_max_11'] = df_w['high'].rolling(11).max()
+            df_w['is_pivot'] = df_w['high'].shift(5) == df_w['rolling_max_11']
+            df_w['body_max'] = df_w[['open', 'close']].max(axis=1)
+            df_w['swing_body_res'] = np.where(df_w['is_pivot'], df_w['body_max'].shift(5), np.nan)
+            df_w['swing_body_res'] = pd.Series(df_w['swing_body_res']).ffill()
+            df_w['swing_wick_res'] = np.where(df_w['is_pivot'], df_w['high'].shift(5), np.nan)
+            df_w['swing_wick_res'] = pd.Series(df_w['swing_wick_res']).ffill()
+
+            recent_df = df_w.iloc[-60:].copy()
+            if len(recent_df) < 20:
+                continue
+            current_row = recent_df.iloc[-1]
+
+            # ============================================================
+            # S2_WickScaled — wick retest breakout
+            # ============================================================
+            setup_active = False
+            trigger_level, breakout_vol, weeks_above = 0.0, 0.0, 0
+            for i in range(1, len(recent_df)):
+                row = recent_df.iloc[i]
+                prev_row = recent_df.iloc[i-1]
+                current_res = row['swing_wick_res']
+                if pd.isna(current_res):
+                    continue
+
+                if not setup_active:
+                    is_liquid = row['close'] >= 5.0 and row['close'] * row['vol_avg'] >= 5_000_000
+                    is_breakout = row['close'] > current_res and prev_row['close'] <= current_res
+                    is_zigzag = row['close'] <= row['ema20'] * 1.25
+                    is_high_vol = row['volume'] > row['vol_avg'] * 2.5
+                    is_aligned = row['ema20'] > row['sma50']
+                    is_sloping_up = i >= 4 and row['ema20'] > recent_df.iloc[i-4]['ema20']
+                    if all([is_liquid, is_breakout, is_zigzag, is_high_vol, is_aligned, is_sloping_up]):
+                        setup_active = True
+                        trigger_level = current_res
+                        breakout_vol = row['volume']
+                        weeks_above = 0
+                    continue
+
+                if setup_active:
+                    if row['close'] < row['sma50'] or weeks_above > 30:
+                        setup_active = False
+                        continue
+                    weeks_above += 1
+                    if i == len(recent_df) - 1 and weeks_above >= 4:
+                        prelim_setups.append({
+                            "symbol": symbol,
+                            "strategy": "S2: Weekly Wick Retest",
+                            "strategy_key": "S2_WickScaled",
+                            "type": "WICK",
+                            "target": float(trigger_level),
+                            "tp1": None,
+                            "age_label": f"{int(weeks_above)}W",
+                            "csv_close": float(current_row['close']),
+                            "csv_vol": float(current_row['volume']),
+                            "breakout_vol": float(breakout_vol),
+                            "atr": float(daily_atr),
+                        })
+
+            # ============================================================
+            # S1_Salmog3_Weekly — weekly body retest with pivot TP
+            # ============================================================
+            setup_active = False
+            trigger_level, breakout_vol, weeks_above = 0.0, 0.0, 0
+            for i in range(1, len(recent_df)):
+                row = recent_df.iloc[i]
+                prev_row = recent_df.iloc[i-1]
+                current_res = row['swing_body_res']
+                if pd.isna(current_res):
+                    continue
+
+                if not setup_active:
+                    is_liquid = row['close'] >= 5.0 and row['close'] * row['vol_avg'] >= 5_000_000
+                    is_breakout = row['close'] > current_res and prev_row['close'] <= current_res
+                    is_macro_bull = pd.notna(row['sma30']) and row['close'] > row['sma30']
+                    is_zigzag = row['close'] <= row['ema20'] * 1.25
+                    is_high_vol = row['volume'] > row['vol_avg'] * 2.5
+                    is_aligned = row['ema20'] > row['sma50']
+                    is_sloping_up = i >= 4 and row['ema20'] > recent_df.iloc[i-4]['ema20']
+                    if all([is_liquid, is_breakout, is_macro_bull, is_zigzag, is_high_vol, is_aligned, is_sloping_up]):
+                        setup_active = True
+                        trigger_level = current_res
+                        breakout_vol = row['volume']
+                        weeks_above = 0
+                    continue
+
+                if setup_active:
+                    # Invalidate on close below the breakout body level
+                    if row['close'] < trigger_level * 0.95 or weeks_above > 30:
+                        setup_active = False
+                        continue
+                    weeks_above += 1
+                    if i == len(recent_df) - 1 and weeks_above >= 4:
+                        # Pullback volume must be < breakout volume
+                        if row['volume'] < breakout_vol:
+                            tp1 = find_next_pivot_above(df_w, trigger_level)
+                            prelim_setups.append({
+                                "symbol": symbol,
+                                "strategy": "Salmog3: Weekly Body Retest",
+                                "strategy_key": "S1_Salmog3_Weekly",
+                                "type": "SALMOG3",
+                                "target": float(trigger_level),
+                                "tp1": float(tp1) if tp1 else None,
+                                "age_label": f"{int(weeks_above)}W",
+                                "csv_close": float(current_row['close']),
+                                "csv_vol": float(current_row['volume']),
+                                "breakout_vol": float(breakout_vol),
+                                "atr": float(daily_atr),
+                            })
+
+            # ============================================================
+            # S1_BodyStrict — 1H V-Shape capitulation
+            # ============================================================
+            csv_1h_path = os.path.join(HISTORICAL_DATA_DIR, f"{symbol}_hourly.csv")
+            if pd.notna(df_w['sma30'].iloc[-1]) and current_row['close'] >= df_w['sma30'].iloc[-1] * 0.85 and os.path.exists(csv_1h_path):
+                cycle_high = df_w['high'].iloc[-26:].max()
+                drawdown = (cycle_high - current_row['close']) / cycle_high
+                # Widen drawdown band — 10-30% catches more V-shape setups in strong leaders
+                if 0.10 <= drawdown <= 0.30:
+                    df_1h = pd.read_csv(csv_1h_path)
+                    df_1h.columns = df_1h.columns.str.lower()
+                    if len(df_1h) >= 6:
+                        for c in ['open', 'high', 'low', 'close']:
+                            df_1h[c] = pd.to_numeric(df_1h[c], errors='coerce').fillna(0)
+                        # Scan last 6 hourly bars (half trading day) for any exhaustion tail
+                        recent_1h = df_1h.iloc[-6:]
+                        recent_1h = recent_1h.copy()
+                        recent_1h['body_min'] = recent_1h[['open', 'close']].min(axis=1)
+                        recent_1h['tail_size'] = (recent_1h['body_min'] - recent_1h['low']) / recent_1h['close'].replace(0, np.nan)
+                        # Lower threshold to 2% — catches more setups; the stop handles risk
+                        tail_bars = recent_1h[recent_1h['tail_size'] > 0.02]
+                        if not tail_bars.empty:
+                            # Use the bar with the deepest wick (strongest absorption signal)
+                            best_bar = tail_bars.loc[tail_bars['tail_size'].idxmax()]
+                            prelim_setups.append({
+                                "symbol": symbol,
+                                "strategy": "S1: 1H V-Shape Capitulation",
+                                "strategy_key": "S1_BodyStrict",
+                                "type": "1H_TAIL",
+                                "target": float(best_bar['low']),
+                                "tp1": None,
+                                "age_label": "1H",
+                                "csv_close": float(recent_1h.iloc[-1]['close']),
+                                "csv_vol": 0.0,
+                                "breakout_vol": 0.0,
+                                "atr": float(daily_atr),
+                            })
+
+            # ============================================================
+            # S3_4H_Hybrid — 4H breakout-retest dual-leg
+            # ============================================================
+            csv_4h_path = os.path.join(HISTORICAL_DATA_DIR, f"{symbol}_4h.csv")
+            s3_target = float(current_row['swing_body_res'])
+            if pd.notna(s3_target) and s3_target > 0 and os.path.exists(csv_4h_path):
+                df_4h = pd.read_csv(csv_4h_path)
+                df_4h.columns = df_4h.columns.str.lower()
+                if len(df_4h) > 60:
+                    for col in ['open', 'high', 'low', 'close', 'volume']:
+                        df_4h[col] = pd.to_numeric(df_4h[col], errors='coerce').fillna(0)
+                    df_4h['ema20'] = df_4h['close'].ewm(span=20, adjust=False).mean()
+                    df_4h['ema50'] = df_4h['close'].ewm(span=50, adjust=False).mean()
+                    df_4h['vol_avg'] = df_4h['volume'].rolling(20).mean()
+                    recent_4h = df_4h.iloc[-60:].copy()
+                    current_4h = recent_4h.iloc[-1]
+                    if current_4h['ema20'] > current_4h['ema50']:
+                        held_bars = 0
+                        for val in reversed(recent_4h['close'].values):
+                            if val > s3_target:
+                                held_bars += 1
+                            else:
+                                break
+                        if held_bars >= 4:
+                            breakout_idx = len(recent_4h) - held_bars - 1
+                            if breakout_idx >= 0:
+                                breakout_bar = recent_4h.iloc[breakout_idx]
+                                if breakout_bar['volume'] > breakout_bar['vol_avg'] * 1.2:
+                                    dist = (current_4h['close'] - s3_target) / s3_target
+                                    if 0 <= dist <= 0.05:
+                                        prelim_setups.append({
+                                            "symbol": symbol,
+                                            "strategy": "S3: 4H PRO Model",
+                                            "strategy_key": "S3_4H_Hybrid",
+                                            "type": "BODY_4H",
+                                            "target": float(s3_target),
+                                            "tp1": None,
+                                            "age_label": f"{held_bars} bars",
+                                            "csv_close": float(current_4h['close']),
+                                            "csv_vol": float(current_4h['volume']),
+                                            "breakout_vol": float(breakout_bar['volume']),
+                                            "atr": float(daily_atr),
+                                        })
+        except Exception:
+            continue
+
+    # ============================================================
+    # Live price fetch + envelope routing
+    # ============================================================
+    symbols_to_fetch = list({s["symbol"] for s in prelim_setups})
+    live_prices = {}
+    if symbols_to_fetch:
+        try:
+            for i in range(0, len(symbols_to_fetch), 50):
+                chunk = symbols_to_fetch[i:i+50]
+                req = StockLatestTradeRequest(symbol_or_symbols=chunk)
+                trades = data_client.get_stock_latest_trade(req)
+                for sym, trade in trades.items():
+                    live_prices[sym] = float(trade.price)
+        except Exception:
+            pass
+
+    discovered_setups = []
+    for setup in prelim_setups:
+        sym = setup["symbol"]
+        live_px = live_prices.get(sym, setup["csv_close"])
+        trigger_level = setup["target"]
+        distance_to_level = ((live_px - trigger_level) / trigger_level) * 100
+        trigger_envelope = trigger_level * (1 + ENVELOPE_PCT)
+        is_ignored = sym in ignored_tickers
+        atr_pct = (setup["atr"] / trigger_level) * 100 if trigger_level > 0 and setup["atr"] > 0 else 0.0
+
+        if live_px <= trigger_envelope:
+            status = "TRIGGER"
+            logic_desc = f"LIVE TRIGGER: Within {ENVELOPE_PCT*100:.1f}% envelope ({setup['age_label']})"
+            if is_ignored:
+                logic_desc = "BLOCKED: Manual override active"
+            actionable = not is_ignored
+        elif 0 < distance_to_level <= 5:
+            status = "APPROACHING"
+            logic_desc = f"APPROACHING: +{distance_to_level:.2f}% above target"
+            actionable = False
+        elif 5 < distance_to_level <= WATCHLIST_MAX_PCT:
+            status = "WATCH"
+            logic_desc = f"WATCHLIST: +{distance_to_level:.2f}% above target"
+            actionable = False
+        else:
+            continue   # too far away to track
+
+        discovered_setups.append({
+            **setup,
+            "live_price": live_px,
+            "dist": distance_to_level,
+            "status": status,
+            "logic": logic_desc,
+            "atr_pct": atr_pct,
+            "actionable": actionable,
+            "ignored": is_ignored,
+        })
+
+    discovered_setups.sort(key=lambda x: (x["status"] != "TRIGGER", abs(x["dist"])))
+    system_state["pending_setups"] = discovered_setups
+
+    # ============================================================
+    # Route triggered setups to broker
+    # ============================================================
+    local_buying_power = {
+        s: float(system_state["accounts"][s]["buying_power"]) if s in system_state["accounts"] else 0.0
+        for s in clients
+    }
+    system_state["scanner_status"] = "Routing live triggers..."
+
+    for setup in discovered_setups:
+        if not setup.get("actionable") or setup.get("ignored"):
+            continue
+
+        for strat_name, client in clients.items():
+            if setup["type"] != TARGET_MAP.get(strat_name):
+                continue
+            try:
+                acct_data = system_state["accounts"].get(strat_name)
+                if not acct_data:
+                    continue
+
+                risk_pct = 0.01
+                usable_capital = min(acct_data["equity"] * 0.10, local_buying_power[strat_name])
+                stop_loss_px = setup["target"] - (1.0 * setup["atr"])
+                risk_per_share = setup["target"] - stop_loss_px
+
+                if risk_per_share <= 0:
+                    continue
+
+                raw_shares = int(math.floor((acct_data["equity"] * risk_pct) / risk_per_share))
+                shares = int(math.floor(usable_capital / setup["target"])) if (raw_shares * setup["target"]) > usable_capital else raw_shares
+                total_cost = shares * setup["target"]
+
+                if shares < 1 or total_cost > local_buying_power[strat_name]:
+                    continue
+
+                if strat_name == "S3_4H_Hybrid" and shares >= 2:
+                    half = shares // 2
+                    runner = shares - half
+                    tp1_px = setup["target"] + (2.0 * risk_per_share)
+                    client.submit_order(LimitOrderRequest(
+                        symbol=setup["symbol"], qty=half, side=OrderSide.BUY, time_in_force=TimeInForce.GTC,
+                        limit_price=round(setup["target"], 2), order_class=OrderClass.BRACKET,
+                        take_profit=TakeProfitRequest(limit_price=round(tp1_px, 2)),
+                        stop_loss=StopLossRequest(stop_price=round(stop_loss_px, 2)),
+                    ))
+                    client.submit_order(LimitOrderRequest(
+                        symbol=setup["symbol"], qty=runner, side=OrderSide.BUY, time_in_force=TimeInForce.GTC,
+                        limit_price=round(setup["target"], 2), order_class=OrderClass.OTO,
+                        stop_loss=StopLossRequest(stop_price=round(stop_loss_px, 2)),
+                    ))
+                    log_system_action(f"[S3] DUAL-LEG: {shares}x {setup['symbol']} @ ${setup['target']:.2f}, TP +2R @ ${tp1_px:.2f}")
+
+                elif strat_name == "S1_Salmog3_Weekly" and shares >= 2 and setup.get("tp1"):
+                    half = shares // 2
+                    runner = shares - half
+                    tp1_px = setup["tp1"]
+                    client.submit_order(LimitOrderRequest(
+                        symbol=setup["symbol"], qty=half, side=OrderSide.BUY, time_in_force=TimeInForce.GTC,
+                        limit_price=round(setup["target"], 2), order_class=OrderClass.BRACKET,
+                        take_profit=TakeProfitRequest(limit_price=round(tp1_px, 2)),
+                        stop_loss=StopLossRequest(stop_price=round(stop_loss_px, 2)),
+                    ))
+                    client.submit_order(LimitOrderRequest(
+                        symbol=setup["symbol"], qty=runner, side=OrderSide.BUY, time_in_force=TimeInForce.GTC,
+                        limit_price=round(setup["target"], 2), order_class=OrderClass.OTO,
+                        stop_loss=StopLossRequest(stop_price=round(stop_loss_px, 2)),
+                    ))
+                    log_system_action(f"[Salmog3] DUAL-LEG: {shares}x {setup['symbol']} @ ${setup['target']:.2f}, TP @ ${tp1_px:.2f} (next pivot), runner trails daily pivots")
+
+                else:
+                    client.submit_order(LimitOrderRequest(
+                        symbol=setup["symbol"], qty=shares, side=OrderSide.BUY, time_in_force=TimeInForce.GTC,
+                        limit_price=round(setup["target"], 2), order_class=OrderClass.OTO,
+                        stop_loss=StopLossRequest(stop_price=round(stop_loss_px, 2)),
+                    ))
+                    log_system_action(f"[{strat_name}] ENTRY: {shares}x {setup['symbol']} @ ${setup['target']:.2f}")
+
+                local_buying_power[strat_name] -= total_cost
+                setup["actionable"] = False
+
+            except Exception as e:
+                log_system_action(f"API REJECTION [{setup['symbol']}]: {str(e)[:80]}")
+                setup["actionable"] = False
+
+    system_state["scanner_status"] = "Monitoring active portfolios."
+    system_state["last_scan_duration_s"] = round(time.time() - scan_start, 1)
+
+
+# ============================================================================
+# S4 INTRADAY — Candidate filter, bar fetcher, scanner, exits
+# ============================================================================
+
+def is_intraday_entry_window():
+    tz = zoneinfo.ZoneInfo("America/New_York")
+    now = datetime.datetime.now(tz)
+    if now.weekday() >= 5:
+        return False
+    if now.hour < S4_START_HOUR:
+        return False
+    if now.hour > S4_LAST_ENTRY_HOUR:
+        return False
+    if now.hour == S4_LAST_ENTRY_HOUR and now.minute >= S4_LAST_ENTRY_MIN:
+        return False
+    return True
+
+
+def is_intraday_management_window():
+    """Window for exit checks: 10:00-15:50 ET. We want to manage positions after the last-entry cutoff."""
+    tz = zoneinfo.ZoneInfo("America/New_York")
+    now = datetime.datetime.now(tz)
+    if now.weekday() >= 5:
+        return False
+    if now.hour < S4_START_HOUR:
+        return False
+    if now.hour > S4_FORCE_FLAT_HOUR:
+        return False
+    if now.hour == S4_FORCE_FLAT_HOUR and now.minute >= S4_FORCE_FLAT_MIN:
+        return False
+    return True
+
+
+def find_s4_candidates():
+    """Daily filter — uptrend, liquid, volatile stocks suitable for intraday momentum trading."""
+    candidates = []
+    if not os.path.exists(HISTORICAL_DATA_DIR):
+        return candidates
+
+    for file in os.listdir(HISTORICAL_DATA_DIR):
+        if not file.endswith('_daily.csv'):
+            continue
+        try:
+            symbol = file.split('_')[0].upper()
+            path = os.path.join(HISTORICAL_DATA_DIR, file)
+            df = pd.read_csv(path)
+            df.columns = df.columns.str.lower()
+            if len(df) < 60:
+                continue
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+
+            df['ema20'] = df['close'].ewm(span=20, adjust=False).mean()
+            df['sma50'] = df['close'].rolling(50).mean()
+            df['atr14'] = calculate_wilders_atr(df, 14)
+            df['dol_vol_20'] = (df['close'] * df['volume']).rolling(20).mean()
+
+            last = df.iloc[-1]
+            if (pd.notna(last['ema20']) and pd.notna(last['sma50']) and pd.notna(last['atr14'])
+                and last['ema20'] > last['sma50']
+                and last['close'] >= S4_MIN_PRICE
+                and last['dol_vol_20'] >= S4_MIN_DOLLAR_VOL
+                and last['close'] > 0
+                and (last['atr14'] / last['close']) >= S4_MIN_ATR_PCT):
+                candidates.append(symbol)
+        except Exception:
+            continue
+
+    log_system_action(f"[S4] Candidate refresh: {len(candidates)} tickers meet macro gate.")
+    return candidates
+
+
+def fetch_15m_bars_batch(symbols, lookback_days=3):
+    """Fetch recent 15-min bars from Alpaca for a list of symbols (single batched API call)."""
+    if not symbols:
+        return None
+    try:
+        tz = zoneinfo.ZoneInfo("America/New_York")
+        end = datetime.datetime.now(tz)
+        start = end - datetime.timedelta(days=lookback_days)
+        req = StockBarsRequest(
+            symbol_or_symbols=symbols,
+            timeframe=TimeFrame(15, TimeFrameUnit.Minute),
+            start=start,
+            end=end,
+        )
+        bars = data_client.get_stock_bars(req)
+        return bars.df
+    except Exception as e:
+        log_system_action(f"[S4] Alpaca bars fetch failed: {str(e)[:80]}")
+        return None
+
+
+def _compute_15m_indicators(df):
+    """Compute 15-min indicators on a clean OHLCV DataFrame (single symbol)."""
+    df = df.copy()
+    df['ema9'] = df['close'].ewm(span=9, adjust=False).mean()
+    df['ema20'] = df['close'].ewm(span=20, adjust=False).mean()
+    df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
+    df['vol_avg'] = df['volume'].rolling(20).mean()
+    df['atr14'] = calculate_wilders_atr(df, 14)
+    df['typ_price'] = (df['high'] + df['low'] + df['close']) / 3
+    df['vwap'] = (df['typ_price'] * df['volume']).cumsum() / df['volume'].cumsum().replace(0, np.nan)
+    df['rolling_high_30'] = df['high'].rolling(30).max().shift(1)
+    return df
+
+
+def _identify_s4_setup(symbol, df):
+    """Run Vectors A/B/C on a single 15m DataFrame. Return setup dict or None."""
+    if len(df) < 30:
+        return None
+    current = df.iloc[-1]
+    prev = df.iloc[-2]
+    atr = current.get('atr14')
+    if pd.isna(atr) or atr <= 0:
+        return None
+
+    # All vectors require above VWAP
+    if pd.isna(current['vwap']) or current['close'] <= current['vwap']:
+        return None
+
+    # ── Vector A: Aggressive breakout ──
+    if (pd.notna(current['rolling_high_30'])
+        and current['close'] > current['rolling_high_30']
+        and prev['close'] <= current['rolling_high_30']
+        and current['volume'] > current['vol_avg'] * 1.5
+        and current['ema9'] > current['ema20']):
+        entry = float(current['close'])
+        stop = entry - 1.0 * float(atr)
+        return {
+            'vector': 'A_BREAKOUT',
+            'entry': entry,
+            'stop': stop,
+            'tp1': entry + 1.5 * (entry - stop),
+            'tp2': entry + 2.5 * (entry - stop),
+            'atr': float(atr),
+            'note': f"15m breakout > ${current['rolling_high_30']:.2f}, vol {current['volume']/current['vol_avg']:.1f}x avg",
+        }
+
+    # ── Vector B: Retest of recent breakout ──
+    recent = df.iloc[-6:].reset_index(drop=True)
+    for i in range(1, len(recent) - 1):
+        bar = recent.iloc[i]
+        prev_bar = recent.iloc[i-1]
+        if (pd.notna(bar['rolling_high_30'])
+            and bar['close'] > bar['rolling_high_30']
+            and prev_bar['close'] <= bar['rolling_high_30']):
+            broke_level = float(bar['rolling_high_30'])
+            broke_vol = float(bar['volume'])
+            # Current bar is pulling back to that level
+            if (current['low'] <= broke_level * 1.003
+                and current['low'] >= broke_level * 0.997
+                and current['volume'] < broke_vol
+                and current['ema9'] > current['ema20']):
+                entry = broke_level
+                stop = broke_level - 0.5 * float(atr)
+                return {
+                    'vector': 'B_RETEST',
+                    'entry': entry,
+                    'stop': stop,
+                    'tp1': entry + 1.5 * (entry - stop),
+                    'tp2': entry + 2.5 * (entry - stop),
+                    'atr': float(atr),
+                    'note': f"Retest of ${broke_level:.2f} breakout, pullback vol < breakout vol",
+                }
+
+    # ── Vector C: VWAP / EMA9 pullback in established uptrend ──
+    last_8 = df.iloc[-8:]
+    if (all(last_8['ema9'] > last_8['ema20'])
+        and current['close'] > current['ema50']):
+        pullback_level = max(float(current['vwap']), float(current['ema9']))
+        if (current['low'] <= pullback_level * 1.005
+            and current['low'] >= current['ema20']
+            and current['volume'] < current['vol_avg'] * 0.8):
+            entry = pullback_level
+            stop = float(current['ema20']) - 0.5 * float(atr)
+            if entry > stop:
+                return {
+                    'vector': 'C_PULLBACK',
+                    'entry': entry,
+                    'stop': stop,
+                    'tp1': entry + 1.5 * (entry - stop),
+                    'tp2': entry + 2.5 * (entry - stop),
+                    'atr': float(atr),
+                    'note': "Pullback to VWAP/EMA9 in established uptrend",
+                }
+
+    return None
+
+
+def scan_intraday_15m():
+    if not is_intraday_entry_window():
+        return
+
+    candidates = system_state.get("s4_candidates", [])
+    if not candidates:
+        candidates = find_s4_candidates()
+        system_state["s4_candidates"] = candidates
+        if not candidates:
+            return
+
+    # Cap concurrent positions
+    try:
+        s4_positions = clients["S4_15M_Momentum"].get_all_positions()
+        if len(s4_positions) >= S4_MAX_OPEN_TRADES:
+            return
+        held_symbols = {p.symbol for p in s4_positions}
+    except Exception:
+        held_symbols = set()
+
+    # Batch fetch 15m bars
+    fetch_list = [s for s in candidates if s not in held_symbols][:200]  # cap to 200 to control API load
+    bars_df = fetch_15m_bars_batch(fetch_list)
+    if bars_df is None or bars_df.empty:
+        return
+
+    setups_found = []
+    for symbol in fetch_list:
+        try:
+            if symbol not in bars_df.index.get_level_values(0):
+                continue
+            df = bars_df.xs(symbol).reset_index()
+            df.columns = df.columns.str.lower()
+            if 'close' not in df.columns or len(df) < 30:
+                continue
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+            df = _compute_15m_indicators(df)
+            setup = _identify_s4_setup(symbol, df)
+            if setup:
+                setups_found.append((symbol, setup))
+        except Exception:
+            continue
+
+    if not setups_found:
+        return
+
+    # Route to broker
+    client = clients["S4_15M_Momentum"]
+    try:
+        account = client.get_account()
+        equity = float(account.equity)
+        bp = float(account.buying_power)
+    except Exception:
+        return
+
+    ignored = get_ignored_tickers()
+    for symbol, setup in setups_found:
+        if symbol in ignored:
+            continue
+        risk_per_share = setup['entry'] - setup['stop']
+        if risk_per_share <= 0:
+            continue
+        shares = int(math.floor((equity * S4_RISK_PCT) / risk_per_share))
+        cost = shares * setup['entry']
+        if shares < 1 or cost > bp:
+            continue
+        try:
+            if setup['vector'] == 'A_BREAKOUT':
+                # Aggressive: market order
+                client.submit_order(MarketOrderRequest(
+                    symbol=symbol, qty=shares, side=OrderSide.BUY,
+                    time_in_force=TimeInForce.DAY,
+                ))
+                # Submit stop separately (Alpaca market+OTO not supported cleanly)
+                client.submit_order(LimitOrderRequest(
+                    symbol=symbol, qty=shares, side=OrderSide.SELL,
+                    time_in_force=TimeInForce.DAY,
+                    limit_price=round(setup['tp1'], 2),
+                ))
+                log_system_action(f"[S4-A] MARKET BUY {shares}x {symbol} @ ~${setup['entry']:.2f} · {setup['note']}")
+            else:
+                # Retest / Pullback: limit order with OTO stop
+                client.submit_order(LimitOrderRequest(
+                    symbol=symbol, qty=shares, side=OrderSide.BUY,
+                    time_in_force=TimeInForce.DAY,
+                    limit_price=round(setup['entry'], 2),
+                    order_class=OrderClass.OTO,
+                    stop_loss=StopLossRequest(stop_price=round(setup['stop'], 2)),
+                ))
+                tag = 'B-RETEST' if setup['vector'] == 'B_RETEST' else 'C-PULLBACK'
+                log_system_action(f"[S4-{tag}] LIMIT BUY {shares}x {symbol} @ ${setup['entry']:.2f} stop ${setup['stop']:.2f} · {setup['note']}")
+            bp -= cost
+        except Exception as e:
+            log_system_action(f"[S4] API REJECTION {symbol}: {str(e)[:80]}")
+
+
+def check_intraday_exits():
+    """Aggressive cut rules for S4 positions. Runs every 2 minutes during the management window."""
+    if not is_intraday_management_window():
+        return
+
+    client = clients.get("S4_15M_Momentum")
+    if not client:
+        return
+
+    try:
+        positions = client.get_all_positions()
+        orders = client.get_orders()
+    except Exception:
+        return
+
+    if not positions:
+        return
+
+    symbols = [p.symbol for p in positions]
+    bars_df = fetch_15m_bars_batch(symbols, lookback_days=2)
+    if bars_df is None or bars_df.empty:
+        return
+
+    for pos in positions:
+        sym = pos.symbol
+        try:
+            if sym not in bars_df.index.get_level_values(0):
+                continue
+            df = bars_df.xs(sym).reset_index()
+            df.columns = df.columns.str.lower()
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+            if len(df) < 20:
+                continue
+            df = _compute_15m_indicators(df)
+            current = df.iloc[-1]
+            prev = df.iloc[-2]
+
+            exit_reason = None
+
+            # Bearish engulfing
+            if current['close'] < prev['open'] and current['open'] > prev['close'] and current['close'] < current['open']:
+                exit_reason = "Bearish engulfing 15m"
+            # Cross below VWAP
+            elif pd.notna(prev['vwap']) and pd.notna(current['vwap']) and prev['close'] > prev['vwap'] and current['close'] < current['vwap']:
+                exit_reason = "Close < VWAP"
+            # Cross below EMA20
+            elif pd.notna(prev['ema20']) and pd.notna(current['ema20']) and prev['close'] >= prev['ema20'] and current['close'] < current['ema20']:
+                exit_reason = "Close < 15m EMA20"
+            else:
+                # Volume drying + no new high
+                last_3_vol = df['volume'].iloc[-3:].mean()
+                avg_vol = current['vol_avg']
+                if pd.notna(avg_vol) and last_3_vol < avg_vol * 0.5:
+                    high_10 = df['high'].iloc[-10:].max()
+                    if current['high'] < high_10:
+                        exit_reason = "Volume dry, no new high"
+                # Time stop: 8 bars without new high
+                if exit_reason is None and len(df) >= 8:
+                    high_8 = df['high'].iloc[-8:].max()
+                    if current['high'] < high_8 * 0.999:  # essentially equal or below
+                        # Compute when high was achieved
+                        last_8 = df.iloc[-8:]
+                        max_idx = last_8['high'].idxmax()
+                        bars_since_high = len(last_8) - 1 - last_8.index.get_loc(max_idx)
+                        if bars_since_high >= 7:
+                            exit_reason = "Time stop: 2hr no new high"
+
+            if exit_reason:
+                qty = int(float(pos.qty))
+                if qty < 1:
+                    continue
+                # Cancel any working sell orders, then market sell
+                for o in orders:
+                    if o.symbol == sym and o.side == OrderSide.SELL:
+                        try:
+                            client.cancel_order_by_id(o.id)
+                        except Exception:
+                            pass
+                client.submit_order(MarketOrderRequest(
+                    symbol=sym, qty=qty, side=OrderSide.SELL,
+                    time_in_force=TimeInForce.DAY,
+                ))
+                log_system_action(f"[S4] CUT {sym} ({qty}sh): {exit_reason}")
+        except Exception:
+            continue
+
+
+def force_flat_intraday():
+    """Force flat all S4 positions and cancel all orders at 15:50 ET. No overnight S4 holds."""
+    try:
+        client = clients["S4_15M_Momentum"]
+        client.close_all_positions(cancel_orders=True)
+        log_system_action("[S4] 15:50 ET FORCE FLAT — all intraday positions liquidated, no overnight.")
+    except Exception as e:
+        log_system_action(f"[S4] Force flat failed: {str(e)[:80]}")
+
+
+# ============================================================================
+# SCHEDULER
+# ============================================================================
+
+scheduler = BackgroundScheduler()
+scheduler.add_job(update_account_states, 'interval', minutes=1)
+scheduler.add_job(run_daily_scan, 'cron', day_of_week='mon-fri', hour=16, minute=15, timezone='US/Eastern')
+# S4 intraday jobs
+scheduler.add_job(find_s4_candidates, 'cron', day_of_week='mon-fri', hour=16, minute=20, timezone='US/Eastern')
+scheduler.add_job(scan_intraday_15m, 'interval', minutes=5)
+scheduler.add_job(check_intraday_exits, 'interval', minutes=2)
+scheduler.add_job(force_flat_intraday, 'cron', day_of_week='mon-fri', hour=15, minute=50, timezone='US/Eastern')
+scheduler.start()
+
+
+# ============================================================================
+# FASTAPI ROUTES
+# ============================================================================
+
+@app.get("/", response_class=HTMLResponse)
+async def dashboard(request: Request):
+    update_account_states()
+    return templates.TemplateResponse(request, "dashboard.html", {"state": system_state})
+
+
+@app.post("/scan")
+async def force_scan():
+    run_daily_scan()
+    return RedirectResponse(url="/", status_code=303)
+
+
+@app.post("/toggle-ignore/{symbol}")
+async def override_ticker(symbol: str):
+    toggle_ignored_ticker(symbol)
+    return RedirectResponse(url="/", status_code=303)
+
+
+@app.post("/edit-entry/{strat_name}/{symbol}")
+async def edit_entry(strat_name: str, symbol: str, new_entry: float = Form(...)):
+    client = clients[strat_name]
+    try:
+        for o in client.get_orders():
+            if o.symbol == symbol and o.side == OrderSide.BUY:
+                client.cancel_order_by_id(o.id)
+        csv_d_path = os.path.join(HISTORICAL_DATA_DIR, f"{symbol}_daily.csv")
+        df_d = pd.read_csv(csv_d_path)
+        df_d.columns = df_d.columns.str.lower()
+        for col in ['high', 'low', 'close']:
+            df_d[col] = pd.to_numeric(df_d[col], errors='coerce')
+        daily_atr = float(calculate_wilders_atr(df_d, 14).iloc[-1])
+        stop_loss_px = new_entry - daily_atr
+        risk_per_share = new_entry - stop_loss_px
+        account = client.get_account()
+        equity = float(account.equity)
+        shares = int(math.floor((equity * 0.01) / risk_per_share))
+        if shares >= 1:
+            client.submit_order(LimitOrderRequest(
+                symbol=symbol, qty=shares, side=OrderSide.BUY, time_in_force=TimeInForce.GTC,
+                limit_price=round(new_entry, 2), order_class=OrderClass.OTO,
+                stop_loss=StopLossRequest(stop_price=round(stop_loss_px, 2)),
+            ))
+            log_system_action(f"[{strat_name}] Entry adjusted: {symbol} → ${new_entry:.2f}")
+    except Exception as e:
+        log_system_action(f"Failed to edit entry for {symbol}: {str(e)[:80]}")
+    return RedirectResponse(url="/", status_code=303)
+
+
+@app.post("/edit-sl/{strat_name}/{symbol}")
+async def edit_sl(strat_name: str, symbol: str, new_sl: float = Form(...)):
+    client = clients[strat_name]
+    try:
+        replaced = 0
+        for o in client.get_orders():
+            if o.symbol == symbol and o.side == OrderSide.SELL and o.stop_price is not None:
+                client.replace_order_by_id(o.id, ReplaceOrderRequest(stop_price=round(new_sl, 2)))
+                replaced += 1
+        if replaced > 0:
+            log_system_action(f"[{strat_name}] SL updated for {symbol} → ${new_sl:.2f}")
+    except Exception as e:
+        log_system_action(f"Failed to edit SL for {symbol}: {str(e)[:80]}")
+    return RedirectResponse(url="/", status_code=303)
+
+
+@app.post("/set-margin/{strat_name}")
+async def set_margin(strat_name: str, margin_amount: float = Form(...)):
+    if strat_name in system_state["margin_limits"]:
+        system_state["margin_limits"][strat_name] = max(0.0, margin_amount)
+        log_system_action(f"[{strat_name}] Margin allowance → ${margin_amount:,.2f}")
+    return RedirectResponse(url="/", status_code=303)
+
+
+@app.post("/schedule-liquidation/{strat_name}/{time_slot}")
+async def schedule_liquidation(strat_name: str, time_slot: str):
+    if time_slot in ["OPEN", "CLOSE"]:
+        system_state["scheduled_liquidations"][strat_name] = time_slot
+        log_system_action(f"[{strat_name}] Auto-flatten scheduled @ market {time_slot}")
+    else:
+        system_state["scheduled_liquidations"][strat_name] = None
+        log_system_action(f"[{strat_name}] Auto-flatten cancelled")
+    return RedirectResponse(url="/", status_code=303)
+
+
+@app.post("/market-sell-all/{strat_name}/{symbol}")
+async def market_sell_all(strat_name: str, symbol: str):
+    try:
+        client = clients[strat_name]
+        for o in client.get_orders():
+            if o.symbol == symbol:
+                client.cancel_order_by_id(o.id)
+        await asyncio.sleep(2)
+        client.close_position(symbol)
+        log_system_action(f"EMERGENCY SELL: {symbol} liquidated in {strat_name}")
+    except Exception:
+        pass
+    return RedirectResponse(url="/", status_code=303)
+
+
+@app.post("/cancel-all-orders")
+async def cancel_all_orders():
+    for strat_name, client in clients.items():
+        try:
+            client.cancel_orders()
+            log_system_action(f"[{strat_name}] All pending orders wiped.")
+        except Exception:
+            pass
+    return RedirectResponse(url="/", status_code=303)
+
+
+@app.post("/liquidate-strategy/{strat_name}")
+async def liquidate_strategy(strat_name: str):
+    execute_liquidation(strat_name)
+    return RedirectResponse(url="/", status_code=303)
+
+
+@app.post("/liquidate-all")
+async def liquidate_all():
+    for strat_name in clients.keys():
+        execute_liquidation(strat_name)
+    return RedirectResponse(url="/", status_code=303)
+
+
+@app.on_event("startup")
+async def startup_event():
+    update_account_states()

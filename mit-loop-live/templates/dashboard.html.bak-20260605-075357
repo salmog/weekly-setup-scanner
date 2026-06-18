@@ -1,0 +1,617 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MIT-Loop Pro · Quant Trading Terminal</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+
+    <script>
+        // Seamless AJAX refresh (every 30s)
+        setInterval(async function() {
+            if (document.querySelector('.modal.show') || document.querySelector('.dropdown-menu.show') || document.activeElement.tagName === 'INPUT') return;
+            try {
+                const res = await fetch(window.location.href);
+                const html = await res.text();
+                const doc = new DOMParser().parseFromString(html, 'text/html');
+                document.querySelector('.app-shell').innerHTML = doc.querySelector('.app-shell').innerHTML;
+                const oldBadge = document.querySelector('.market-status');
+                const newBadge = doc.querySelector('.market-status');
+                if (oldBadge && newBadge) { oldBadge.className = newBadge.className; oldBadge.innerText = newBadge.innerText; }
+            } catch (e) { console.error("Refresh failed:", e); }
+        }, 30000);
+
+        function validatePanic() {
+            document.getElementById('panicConfirmBtn').disabled = document.getElementById('panicInput').value !== 'LIQUIDATE';
+        }
+
+        function checkRisk(inputObj, entryPrice, qty, nav) {
+            const newSl = parseFloat(inputObj.value);
+            const warnEl = document.getElementById('risk-warning-' + inputObj.id);
+            if (isNaN(newSl) || !warnEl) return;
+            const risk = (entryPrice - newSl) * qty;
+            const maxRisk = nav * 0.01;
+            if (risk > maxRisk) {
+                warnEl.style.display = 'block';
+                warnEl.innerHTML = `<b>WARNING:</b> Risk $${risk.toFixed(2)} exceeds 1.0% NAV ($${maxRisk.toFixed(2)})`;
+            } else { warnEl.style.display = 'none'; }
+        }
+
+        function updateTimer() {
+            const now = new Date();
+            const est = new Date(now.toLocaleString("en-US", {timeZone: "America/New_York"}));
+            const day = est.getDay(), h = est.getHours(), m = est.getMinutes();
+            let target = new Date(est), prefix = "";
+            if (day >= 1 && day <= 5 && (h > 9 || (h === 9 && m >= 30)) && h < 16) {
+                target.setHours(16, 0, 0, 0); prefix = "CLOSE IN ";
+            } else {
+                prefix = "OPEN IN ";
+                if (day === 5 && h >= 16) { target.setDate(target.getDate() + 3); target.setHours(9, 30, 0, 0); }
+                else if (day === 6) { target.setDate(target.getDate() + 2); target.setHours(9, 30, 0, 0); }
+                else if (day === 0) { target.setDate(target.getDate() + 1); target.setHours(9, 30, 0, 0); }
+                else if (h >= 16) { target.setDate(target.getDate() + 1); target.setHours(9, 30, 0, 0); }
+                else { target.setHours(9, 30, 0, 0); }
+            }
+            const diff = target - est;
+            const hh = Math.floor(diff/3600000), mm = Math.floor((diff%3600000)/60000), ss = Math.floor((diff%60000)/1000);
+            const el = document.getElementById("market-timer");
+            if (el) el.innerText = prefix + hh + "h " + mm + "m " + ss + "s";
+        }
+        setInterval(updateTimer, 1000);
+        window.onload = updateTimer;
+    </script>
+
+    <style>
+        :root {
+            --bg-0: #0a0d14;
+            --bg-1: #0f131c;
+            --bg-2: #161b27;
+            --bg-3: #1c2330;
+            --border: #232b3a;
+            --border-strong: #2e3849;
+            --text-0: #f5f7fa;
+            --text-1: #c6cad3;
+            --text-2: #828a99;
+            --text-3: #555c6b;
+            --accent: #4d8eff;
+            --accent-2: #00d4ff;
+            --green: #22c993;
+            --green-bg: rgba(34, 201, 147, 0.12);
+            --red: #ff5b6b;
+            --red-bg: rgba(255, 91, 107, 0.12);
+            --yellow: #ffba3c;
+            --yellow-bg: rgba(255, 186, 60, 0.12);
+            --purple: #a878ff;
+        }
+        * { font-family: 'Inter', -apple-system, sans-serif; }
+        body { background-color: var(--bg-0); color: var(--text-1); margin: 0; font-size: 13px; line-height: 1.4; }
+        .mono { font-family: 'JetBrains Mono', monospace; font-variant-numeric: tabular-nums; }
+
+        /* === HEADER === */
+        .top-bar { background: var(--bg-1); border-bottom: 1px solid var(--border); padding: 12px 24px; display: flex; justify-content: space-between; align-items: center; position: sticky; top: 0; z-index: 100; }
+        .brand { display: flex; align-items: center; gap: 10px; }
+        .brand-logo { width: 28px; height: 28px; border-radius: 6px; background: linear-gradient(135deg, var(--accent) 0%, var(--accent-2) 100%); display: flex; align-items: center; justify-content: center; font-weight: 800; color: white; font-size: 14px; }
+        .brand-name { font-size: 14px; font-weight: 700; color: var(--text-0); letter-spacing: -0.3px; }
+        .brand-sub { font-size: 10px; color: var(--text-2); text-transform: uppercase; letter-spacing: 1px; }
+        .header-actions { display: flex; gap: 8px; align-items: center; }
+
+        /* === BADGES === */
+        .market-status { padding: 4px 10px; border-radius: 4px; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; }
+        .market-status.open { background: var(--green-bg); color: var(--green); border: 1px solid rgba(34,201,147,0.3); }
+        .market-status.closed { background: rgba(120,128,150,0.12); color: var(--text-2); border: 1px solid var(--border); }
+        .pill { display: inline-block; padding: 2px 8px; border-radius: 3px; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; }
+        .pill-green { background: var(--green-bg); color: var(--green); }
+        .pill-red { background: var(--red-bg); color: var(--red); }
+        .pill-yellow { background: var(--yellow-bg); color: var(--yellow); }
+        .pill-blue { background: rgba(77,142,255,0.12); color: var(--accent); }
+        .pill-grey { background: rgba(120,128,150,0.12); color: var(--text-2); }
+        .pill-purple { background: rgba(168,120,255,0.12); color: var(--purple); }
+
+        /* === SYSTEM OVERVIEW STRIP === */
+        .system-strip { display: grid; grid-template-columns: repeat(6, 1fr); gap: 1px; background: var(--border); border-bottom: 1px solid var(--border); }
+        .strip-cell { background: var(--bg-1); padding: 12px 18px; }
+        .strip-label { font-size: 9px; color: var(--text-2); text-transform: uppercase; letter-spacing: 1px; font-weight: 700; margin-bottom: 4px; }
+        .strip-value { font-size: 18px; font-weight: 700; color: var(--text-0); }
+        .strip-value.mono { font-family: 'JetBrains Mono', monospace; }
+        .strip-sub { font-size: 10px; color: var(--text-2); margin-top: 2px; }
+        .live-pulse { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--green); animation: pulse 1.5s ease-in-out infinite; vertical-align: middle; margin-right: 6px; }
+        @keyframes pulse { 0%,100% {opacity:1;} 50% {opacity:0.3;} }
+
+        /* === LAYOUT === */
+        .app-shell { padding: 16px 20px; }
+        .strategy-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; margin-bottom: 16px; }
+
+        /* === STRATEGY CARDS === */
+        .strat-card { background: var(--bg-1); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+        .strat-header { background: var(--bg-2); border-bottom: 1px solid var(--border); padding: 12px 16px; display: flex; justify-content: space-between; align-items: center; }
+        .strat-title { font-size: 13px; font-weight: 700; color: var(--text-0); }
+        .strat-tag { font-size: 10px; color: var(--text-2); margin-top: 2px; font-weight: 500; }
+        .strat-controls { display: flex; gap: 6px; }
+        .strat-body { padding: 14px 16px; }
+
+        .metrics-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 12px; }
+        .metric { background: var(--bg-2); border-radius: 5px; padding: 10px 12px; border-left: 2px solid var(--border-strong); }
+        .metric-label { font-size: 9px; color: var(--text-2); text-transform: uppercase; letter-spacing: 0.8px; font-weight: 700; margin-bottom: 4px; }
+        .metric-value { font-size: 16px; font-weight: 700; color: var(--text-0); }
+        .metric-value.mono { font-family: 'JetBrains Mono', monospace; }
+        .metric.green { border-left-color: var(--green); } .metric.green .metric-value { color: var(--green); }
+        .metric.red { border-left-color: var(--red); } .metric.red .metric-value { color: var(--red); }
+        .metric.accent { border-left-color: var(--accent); }
+
+        .bp-bar { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; padding: 10px; background: var(--bg-2); border-radius: 5px; margin-bottom: 14px; border: 1px solid var(--border); }
+        .bp-cell { text-align: center; padding: 4px 0; border-right: 1px solid var(--border); }
+        .bp-cell:last-child { border-right: none; }
+        .bp-label { font-size: 9px; color: var(--text-2); text-transform: uppercase; font-weight: 700; letter-spacing: 0.5px; }
+        .bp-value { font-size: 13px; font-weight: 700; margin-top: 2px; font-family: 'JetBrains Mono', monospace; }
+        .bp-value.accent { color: var(--accent); }
+        .bp-value.purple { color: var(--purple); }
+        .bp-value.cyan { color: var(--accent-2); }
+
+        .section-label { font-size: 10px; color: var(--text-2); text-transform: uppercase; font-weight: 700; letter-spacing: 1px; margin: 12px 0 6px; display: flex; justify-content: space-between; align-items: center; }
+        .section-count { background: var(--bg-3); color: var(--text-1); padding: 1px 6px; border-radius: 3px; font-size: 9px; }
+
+        /* === TABLES === */
+        .pro-table { width: 100%; font-size: 12px; }
+        .pro-table thead th { background: var(--bg-2); color: var(--text-2); font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.8px; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+        .pro-table tbody td { padding: 9px 10px; border-bottom: 1px solid var(--border); }
+        .pro-table tbody tr:hover { background: var(--bg-2); }
+        .pro-table tbody tr:last-child td { border-bottom: none; }
+        .ticker-cell { color: var(--accent); font-weight: 700; }
+        .num { font-family: 'JetBrains Mono', monospace; color: var(--text-0); font-weight: 600; }
+        .num-accent { color: var(--accent); }
+        .num-sub { color: var(--text-2); font-size: 11px; }
+        .pl-green { color: var(--green); font-weight: 700; }
+        .pl-red { color: var(--red); font-weight: 700; }
+
+        /* === BUTTONS === */
+        .btn-pro { padding: 4px 10px; border-radius: 4px; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; border: 1px solid; cursor: pointer; transition: all 0.15s; }
+        .btn-pro-primary { background: var(--accent); border-color: var(--accent); color: white; }
+        .btn-pro-primary:hover { filter: brightness(1.1); }
+        .btn-pro-outline { background: transparent; border-color: var(--border-strong); color: var(--text-1); }
+        .btn-pro-outline:hover { border-color: var(--accent); color: var(--accent); }
+        .btn-pro-danger { background: transparent; border-color: var(--red); color: var(--red); }
+        .btn-pro-danger:hover { background: var(--red); color: white; }
+        .btn-pro-warn { background: transparent; border-color: var(--yellow); color: var(--yellow); }
+        .btn-pro-warn:hover { background: var(--yellow); color: var(--bg-0); }
+        .btn-pro-info { background: transparent; border-color: var(--accent-2); color: var(--accent-2); }
+        .btn-pro-info:hover { background: var(--accent-2); color: var(--bg-0); }
+
+        /* === RADAR === */
+        .radar-card { background: var(--bg-1); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+        .radar-header { background: var(--bg-2); border-bottom: 1px solid var(--border); padding: 12px 16px; display: flex; justify-content: space-between; align-items: center; }
+        .radar-scroll { max-height: 560px; overflow-y: auto; }
+        .radar-row.trigger { background: rgba(34,201,147,0.04); border-left: 2px solid var(--green); }
+        .radar-row.approaching { background: rgba(255,186,60,0.04); border-left: 2px solid var(--yellow); }
+        .radar-row.watch { border-left: 2px solid transparent; }
+        .radar-row.ignored { opacity: 0.4; }
+
+        /* === TERMINAL === */
+        .term-card { background: var(--bg-1); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+        .term-header { background: var(--bg-2); border-bottom: 1px solid var(--border); padding: 12px 16px; }
+        .term-body { background: #050810; padding: 14px; height: 540px; overflow-y: auto; font-family: 'JetBrains Mono', monospace; font-size: 11px; line-height: 1.6; color: var(--text-1); }
+        .term-line { margin-bottom: 2px; }
+        .term-time { color: var(--accent-2); margin-right: 8px; }
+
+        /* === MODALS === */
+        .modal-content { background: var(--bg-1); border: 1px solid var(--border-strong); color: var(--text-1); border-radius: 8px; }
+        .modal-header, .modal-footer { border-color: var(--border); }
+        .modal-title { color: var(--text-0); font-weight: 700; }
+
+        /* === SPEC SHEET === */
+        .spec-section { margin-bottom: 18px; }
+        .spec-h { font-size: 10px; color: var(--text-2); text-transform: uppercase; font-weight: 800; letter-spacing: 1px; margin-bottom: 6px; }
+        .spec-p { font-size: 13px; color: var(--text-1); }
+        .spec-tagline { font-size: 13px; color: var(--text-1); font-style: italic; padding: 12px; background: var(--bg-2); border-left: 3px solid var(--accent); border-radius: 4px; margin-bottom: 18px; }
+        .spec-list { list-style: none; padding: 0; margin: 0; }
+        .spec-list li { padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 12px; color: var(--text-1); }
+        .spec-list li:last-child { border-bottom: none; }
+        .spec-list li::before { content: '▸ '; color: var(--accent); font-weight: 700; }
+        .spec-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+        .spec-cell { background: var(--bg-2); padding: 10px 12px; border-radius: 5px; border-left: 2px solid var(--accent); }
+        .spec-cell-label { font-size: 9px; color: var(--text-2); text-transform: uppercase; font-weight: 700; letter-spacing: 0.8px; margin-bottom: 4px; }
+        .spec-cell-value { font-size: 12px; color: var(--text-0); font-weight: 500; }
+
+        /* === FORMS === */
+        .form-control { background: var(--bg-3); border: 1px solid var(--border-strong); color: var(--text-0); font-family: 'JetBrains Mono', monospace; }
+        .form-control:focus { background: var(--bg-3); color: var(--text-0); border-color: var(--accent); box-shadow: none; }
+        .input-group-text { background: var(--bg-2); border: 1px solid var(--border-strong); color: var(--text-2); }
+        .dropdown-menu { background: var(--bg-1); border: 1px solid var(--border-strong); }
+        .dropdown-item { color: var(--text-1); font-size: 12px; padding: 6px 14px; }
+        .dropdown-item:hover { background: var(--bg-3); color: var(--text-0); }
+        .dropdown-divider { border-color: var(--border); }
+    </style>
+</head>
+<body>
+
+<!-- ============================================================== -->
+<!-- TOP BAR                                                         -->
+<!-- ============================================================== -->
+<div class="top-bar">
+    <div class="brand">
+        <div class="brand-logo">M</div>
+        <div>
+            <div class="brand-name">MIT-Loop Pro</div>
+            <div class="brand-sub">Quant Trading Terminal · v2.0</div>
+        </div>
+    </div>
+
+    <div class="header-actions">
+        <span class="market-status {% if 'OPEN' in state.market_status %}open{% else %}closed{% endif %}">{{ state.market_status }}</span>
+        <span id="market-timer" class="pill pill-grey mono">--:--:--</span>
+
+        <form action="/cancel-all-orders" method="POST" style="margin: 0;" onsubmit="return confirm('Cancel ALL pending orders across ALL accounts?');">
+            <button type="submit" class="btn-pro btn-pro-warn">Wipe All Limits</button>
+        </form>
+        <button type="button" class="btn-pro btn-pro-danger" data-bs-toggle="modal" data-bs-target="#globalPanicModal">Liquidate All</button>
+        <form action="/scan" method="POST" style="margin: 0;">
+            <button type="submit" class="btn-pro btn-pro-primary">Force Scan</button>
+        </form>
+    </div>
+</div>
+
+<!-- ============================================================== -->
+<!-- SYSTEM OVERVIEW STRIP                                           -->
+<!-- ============================================================== -->
+{% set total_equity = state.accounts.values()|sum(attribute='equity') %}
+{% set total_pnl = state.accounts.values()|sum(attribute='total_unrealized_pnl') %}
+{% set total_day = state.accounts.values()|sum(attribute='day_pnl') %}
+{% set total_positions = state.accounts.values()|sum(attribute='active_orders') %}
+{% set total_pending_entries = state.accounts.values()|sum(attribute='pending_entries') %}
+{% set total_pending_exits = state.accounts.values()|sum(attribute='pending_exits') %}
+
+<div class="system-strip">
+    <div class="strip-cell">
+        <div class="strip-label">Total Equity</div>
+        <div class="strip-value mono">${{ "{:,.0f}".format(total_equity) }}</div>
+        <div class="strip-sub">{{ state.accounts|length }} strategies</div>
+    </div>
+    <div class="strip-cell">
+        <div class="strip-label">Unrealized P&L</div>
+        <div class="strip-value mono" style="color: {% if total_pnl >= 0 %}var(--green){% else %}var(--red){% endif %};">
+            {% if total_pnl >= 0 %}+{% endif %}${{ "{:,.2f}".format(total_pnl) }}
+        </div>
+        <div class="strip-sub">Across all open positions</div>
+    </div>
+    <div class="strip-cell">
+        <div class="strip-label">Today's P&L</div>
+        <div class="strip-value mono" style="color: {% if total_day >= 0 %}var(--green){% else %}var(--red){% endif %};">
+            {% if total_day >= 0 %}+{% endif %}${{ "{:,.2f}".format(total_day) }}
+        </div>
+        <div class="strip-sub">Session change</div>
+    </div>
+    <div class="strip-cell">
+        <div class="strip-label">Open Setups</div>
+        <div class="strip-value mono">{{ state.pending_setups|length }}</div>
+        <div class="strip-sub">{{ state.pending_setups|selectattr('status','equalto','TRIGGER')|list|length }} live triggers</div>
+    </div>
+    <div class="strip-cell">
+        <div class="strip-label">Pending Orders</div>
+        <div class="strip-value mono">{{ total_pending_entries }} <span style="font-size: 12px; color: var(--text-2);">/ {{ total_pending_exits }}</span></div>
+        <div class="strip-sub">Entries / Exits</div>
+    </div>
+    <div class="strip-cell">
+        <div class="strip-label"><span class="live-pulse"></span>Scanner</div>
+        <div class="strip-value" style="font-size: 13px;">{{ state.scanner_status }}</div>
+        <div class="strip-sub">Last scan: {{ state.last_scan }} ({{ state.last_scan_duration_s }}s)</div>
+    </div>
+</div>
+
+<div class="app-shell">
+
+<!-- ============================================================== -->
+<!-- STRATEGY GRID                                                   -->
+<!-- ============================================================== -->
+<div class="strategy-grid">
+    {% for strat_name in state.strategy_order %}
+    {% if strat_name in state.accounts %}
+    {% set account = state.accounts[strat_name] %}
+    {% set spec = state.strategy_specs[strat_name] %}
+    <div class="strat-card">
+
+        <!-- Header -->
+        <div class="strat-header">
+            <div>
+                <div class="strat-title">{{ strat_name }}</div>
+                <div class="strat-tag">{{ spec.name }}</div>
+            </div>
+            <div class="strat-controls">
+                <button class="btn-pro btn-pro-info" data-bs-toggle="modal" data-bs-target="#spec-{{ strat_name }}">Spec</button>
+                <div class="dropdown">
+                    <button class="btn-pro btn-pro-danger dropdown-toggle" data-bs-toggle="dropdown">
+                        Flatten
+                        {% if state.scheduled_liquidations[strat_name] %} · {{ state.scheduled_liquidations[strat_name] }}{% endif %}
+                    </button>
+                    <ul class="dropdown-menu dropdown-menu-end">
+                        <li><form action="/liquidate-strategy/{{ strat_name }}" method="POST" style="margin: 0;" onsubmit="return confirm('Market-sell all {{ strat_name }} positions NOW?');"><button class="dropdown-item" style="color: var(--red);">▸ Market Sell All Now</button></form></li>
+                        <li><hr class="dropdown-divider"></li>
+                        <li><form action="/schedule-liquidation/{{ strat_name }}/OPEN" method="POST" style="margin: 0;"><button class="dropdown-item">▸ Schedule @ Open (09:31)</button></form></li>
+                        <li><form action="/schedule-liquidation/{{ strat_name }}/CLOSE" method="POST" style="margin: 0;"><button class="dropdown-item">▸ Schedule @ Close (15:56)</button></form></li>
+                        {% if state.scheduled_liquidations[strat_name] %}
+                        <li><hr class="dropdown-divider"></li>
+                        <li><form action="/schedule-liquidation/{{ strat_name }}/OFF" method="POST" style="margin: 0;"><button class="dropdown-item" style="color: var(--yellow);">▸ Cancel Schedule</button></form></li>
+                        {% endif %}
+                    </ul>
+                </div>
+            </div>
+        </div>
+
+        <div class="strat-body">
+
+            <!-- KPI Metrics -->
+            <div class="metrics-row">
+                <div class="metric accent">
+                    <div class="metric-label">NAV</div>
+                    <div class="metric-value mono">${{ "{:,.0f}".format(account.equity) }}</div>
+                </div>
+                <div class="metric {% if account.total_unrealized_pnl >= 0 %}green{% else %}red{% endif %}">
+                    <div class="metric-label">Open P&L</div>
+                    <div class="metric-value mono">{% if account.total_unrealized_pnl >= 0 %}+{% endif %}${{ "{:,.0f}".format(account.total_unrealized_pnl) }}</div>
+                </div>
+                <div class="metric {% if account.day_pnl >= 0 %}green{% else %}red{% endif %}">
+                    <div class="metric-label">Today P&L</div>
+                    <div class="metric-value mono">{% if account.day_pnl >= 0 %}+{% endif %}${{ "{:,.0f}".format(account.day_pnl) }}</div>
+                </div>
+            </div>
+
+            <!-- Capital Bar -->
+            <div class="bp-bar">
+                <div class="bp-cell">
+                    <div class="bp-label">Buying Power</div>
+                    <div class="bp-value accent">${{ "{:,.0f}".format(account.buying_power) }}</div>
+                </div>
+                <div class="bp-cell">
+                    <div class="bp-label">In Orders</div>
+                    <div class="bp-value purple">${{ "{:,.0f}".format(account.tied_up_cash) }}</div>
+                </div>
+                <div class="bp-cell">
+                    <div class="bp-label">Cash</div>
+                    <div class="bp-value cyan">${{ "{:,.0f}".format(account.cash) }}</div>
+                </div>
+            </div>
+
+            <!-- Margin Override -->
+            <form action="/set-margin/{{ strat_name }}" method="POST" class="d-flex mb-3" style="gap: 8px; align-items: center;">
+                <span class="metric-label" style="white-space: nowrap;">Margin Cap:</span>
+                <div class="input-group input-group-sm" style="flex: 1;">
+                    <span class="input-group-text">$</span>
+                    <input type="number" step="0.01" name="margin_amount" class="form-control" value="{{ account.margin_limit }}">
+                    <button class="btn-pro btn-pro-outline">Save</button>
+                </div>
+            </form>
+
+            <!-- WAITING (Pending Entries) -->
+            <div class="section-label">
+                <span><span class="pill pill-yellow">Waiting</span> · Pending Entry Orders</span>
+                <span class="section-count">{{ account.pending_entries }}</span>
+            </div>
+            <table class="pro-table">
+                <thead><tr><th>Ticker</th><th>Qty</th><th>Limit Price</th><th class="text-end">Action</th></tr></thead>
+                <tbody>
+                    {% for order in account.pending_buys %}
+                    <tr>
+                        <td><span class="ticker-cell">{{ order.symbol }}</span></td>
+                        <td><span class="num">{{ order.qty|int }}</span></td>
+                        <td><span class="num num-accent">${{ "{:.2f}".format(order.limit_price) }}</span></td>
+                        <td class="text-end">
+                            <button class="btn-pro btn-pro-warn" data-bs-toggle="modal" data-bs-target="#edit-entry-{{ strat_name }}-{{ order.symbol }}">Edit</button>
+                            <form action="/market-sell-all/{{ strat_name }}/{{ order.symbol }}" method="POST" style="display:inline; margin:0;" onsubmit="return confirm('Cancel limit order for {{ order.symbol }}?');"><button class="btn-pro btn-pro-danger">Kill</button></form>
+                        </td>
+                    </tr>
+                    <div class="modal fade" id="edit-entry-{{ strat_name }}-{{ order.symbol }}" tabindex="-1">
+                        <div class="modal-dialog modal-sm"><div class="modal-content">
+                            <div class="modal-header"><h5 class="modal-title">Adjust Entry · {{ order.symbol }}</h5><button class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div>
+                            <form action="/edit-entry/{{ strat_name }}/{{ order.symbol }}" method="POST">
+                                <div class="modal-body">
+                                    <p style="font-size:11px; color:var(--text-2);">Cancels old limit, recalculates ATR stop, re-sizes to 1.0% NAV.</p>
+                                    <label class="metric-label">New Limit Price</label>
+                                    <input type="number" step="0.01" name="new_entry" class="form-control" value="{{ order.limit_price }}" required>
+                                </div>
+                                <div class="modal-footer"><button class="btn-pro btn-pro-primary w-100">Recalculate & Route</button></div>
+                            </form>
+                        </div></div>
+                    </div>
+                    {% else %}
+                    <tr><td colspan="4" style="text-align: center; color: var(--text-2); font-style: italic; padding: 14px;">No pending limit orders</td></tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+
+            <!-- IN PLAY (Active Positions) -->
+            <div class="section-label">
+                <span><span class="pill pill-green">In Play</span> · Active Positions</span>
+                <span class="section-count">{{ account.positions|length }}</span>
+            </div>
+            <table class="pro-table">
+                <thead><tr><th>Ticker · P&L</th><th>Entry · Live</th><th>SL · TP</th><th>ATR</th><th class="text-end">Action</th></tr></thead>
+                <tbody>
+                    {% for pos in account.positions %}
+                    <tr>
+                        <td>
+                            <div><span class="ticker-cell">{{ pos.symbol }}</span> <span class="num-sub">· {{ pos.qty }} sh</span></div>
+                            <div style="margin-top: 4px;">
+                                <span class="{% if pos.unrealized_pl >= 0 %}pl-green{% else %}pl-red{% endif %}" style="font-family: 'JetBrains Mono', monospace; font-size: 11px;">
+                                    {% if pos.unrealized_pl >= 0 %}+{% endif %}${{ "{:.2f}".format(pos.unrealized_pl) }}
+                                </span>
+                                <span class="num-sub" style="margin-left: 6px;">({{ "{:+.2f}".format(pos.unrealized_plpc) }}%)</span>
+                            </div>
+                        </td>
+                        <td>
+                            <div class="num">${{ "{:.2f}".format(pos.avg_entry) }}</div>
+                            <div style="margin-top: 4px;"><span class="live-pulse"></span><span class="num num-accent">${{ "{:.2f}".format(pos.current_price) }}</span></div>
+                        </td>
+                        <td>
+                            <div><span class="num-sub">SL:</span> <span class="num pl-red">${{ "{:.2f}".format(pos.sl_price) if pos.sl_price else "—" }}</span></div>
+                            {% if pos.tp_price %}<div style="margin-top: 4px;"><span class="num-sub">TP:</span> <span class="num pl-green">${{ "{:.2f}".format(pos.tp_price) }}</span></div>{% endif %}
+                        </td>
+                        <td>
+                            <div class="num">${{ "{:.2f}".format(pos.current_atr) if pos.current_atr else "—" }}</div>
+                            <div class="num-sub" style="margin-top: 4px;">{{ "{:.1f}".format(pos.current_atr_pct) if pos.current_atr_pct else "0.0" }}%</div>
+                        </td>
+                        <td class="text-end">
+                            <button class="btn-pro btn-pro-info" data-bs-toggle="modal" data-bs-target="#edit-sl-{{ strat_name }}-{{ pos.symbol }}" style="margin-bottom: 4px;">SL</button>
+                            <form action="/market-sell-all/{{ strat_name }}/{{ pos.symbol }}" method="POST" style="margin: 0;" onsubmit="return confirm('Market sell {{ pos.symbol }}?');"><button class="btn-pro btn-pro-danger">Exit</button></form>
+                        </td>
+                    </tr>
+                    <div class="modal fade" id="edit-sl-{{ strat_name }}-{{ pos.symbol }}" tabindex="-1">
+                        <div class="modal-dialog modal-sm"><div class="modal-content">
+                            <div class="modal-header"><h5 class="modal-title">Adjust Stop · {{ pos.symbol }}</h5><button class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div>
+                            <form action="/edit-sl/{{ strat_name }}/{{ pos.symbol }}" method="POST">
+                                <div class="modal-body">
+                                    <div style="font-size: 12px; margin-bottom: 12px;">
+                                        Entry: <span class="num">${{ "{:.2f}".format(pos.avg_entry) }}</span><br>
+                                        Current SL: <span class="num pl-red">${{ "{:.2f}".format(pos.sl_price) if pos.sl_price else "—" }}</span>
+                                    </div>
+                                    <label class="metric-label">New Stop Price</label>
+                                    <input type="number" step="0.01" name="new_sl" id="sl-input-{{ strat_name }}-{{ pos.symbol }}" class="form-control" value="{{ pos.sl_price }}" required onkeyup="checkRisk(this, {{ pos.avg_entry }}, {{ pos.qty }}, {{ account.equity }})">
+                                    <div id="risk-warning-sl-input-{{ strat_name }}-{{ pos.symbol }}" class="pl-red" style="font-size: 11px; margin-top: 6px; display: none;"></div>
+                                </div>
+                                <div class="modal-footer"><button class="btn-pro btn-pro-primary w-100">Update Stop</button></div>
+                            </form>
+                        </div></div>
+                    </div>
+                    {% else %}
+                    <tr><td colspan="5" style="text-align: center; color: var(--text-2); font-style: italic; padding: 14px;">No active positions</td></tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+
+        </div>
+    </div>
+
+    <!-- SPEC SHEET MODAL -->
+    <div class="modal fade" id="spec-{{ strat_name }}" tabindex="-1">
+        <div class="modal-dialog modal-lg modal-dialog-scrollable"><div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">{{ strat_name }} · Strategy Specification</h5>
+                <button class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <div class="spec-tagline">{{ spec.tagline }}</div>
+
+                <div class="spec-section">
+                    <div class="spec-h">Timeframe</div>
+                    <div class="spec-p">{{ spec.timeframe }}</div>
+                </div>
+
+                <div class="spec-section">
+                    <div class="spec-h">Setup Rules</div>
+                    <ul class="spec-list">
+                        {% for rule in spec.rules %}<li>{{ rule }}</li>{% endfor %}
+                    </ul>
+                </div>
+
+                <div class="spec-section">
+                    <div class="spec-grid">
+                        <div class="spec-cell"><div class="spec-cell-label">Entry</div><div class="spec-cell-value">{{ spec.entry }}</div></div>
+                        <div class="spec-cell"><div class="spec-cell-label">Stop-Loss</div><div class="spec-cell-value">{{ spec.stop }}</div></div>
+                        <div class="spec-cell"><div class="spec-cell-label">TP Leg 1 (50%)</div><div class="spec-cell-value">{{ spec.tp_leg1 }}</div></div>
+                        <div class="spec-cell"><div class="spec-cell-label">Runner Exit (50%)</div><div class="spec-cell-value">{{ spec.exit_runner }}</div></div>
+                        <div class="spec-cell"><div class="spec-cell-label">Trailing</div><div class="spec-cell-value">{{ spec.trail }}</div></div>
+                        <div class="spec-cell"><div class="spec-cell-label">Risk per Trade</div><div class="spec-cell-value">{{ spec.risk }}</div></div>
+                    </div>
+                </div>
+            </div>
+        </div></div>
+    </div>
+    {% endif %}
+    {% endfor %}
+</div>
+
+<!-- ============================================================== -->
+<!-- RADAR + TERMINAL                                                -->
+<!-- ============================================================== -->
+<div class="row g-3">
+    <div class="col-lg-8">
+        <div class="radar-card">
+            <div class="radar-header">
+                <div>
+                    <div class="strat-title">Strategic Pullback Radar</div>
+                    <div class="strat-tag">Real-time distance to entry · sorted by trigger proximity</div>
+                </div>
+                <div style="display: flex; gap: 6px; align-items: center;">
+                    <span class="pill pill-green">Trigger: {{ state.pending_setups|selectattr('status','equalto','TRIGGER')|list|length }}</span>
+                    <span class="pill pill-yellow">Approaching: {{ state.pending_setups|selectattr('status','equalto','APPROACHING')|list|length }}</span>
+                    <span class="pill pill-grey">Watch: {{ state.pending_setups|selectattr('status','equalto','WATCH')|list|length }}</span>
+                </div>
+            </div>
+            <div class="radar-scroll">
+                <table class="pro-table">
+                    <thead>
+                        <tr>
+                            <th>Status</th><th>Strategy</th><th>Ticker</th><th>Live</th>
+                            <th>Entry</th><th>TP1</th><th>ATR</th><th>Dist</th><th>Age</th>
+                            <th class="text-end">Override</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for setup in state.pending_setups %}
+                        <tr class="radar-row {{ setup.status|lower }} {% if setup.ignored %}ignored{% endif %}">
+                            <td>
+                                {% if setup.status == 'TRIGGER' %}<span class="pill pill-green">Trigger</span>
+                                {% elif setup.status == 'APPROACHING' %}<span class="pill pill-yellow">Approach</span>
+                                {% else %}<span class="pill pill-grey">Watch</span>{% endif %}
+                            </td>
+                            <td><span class="pill pill-blue">{{ setup.strategy_key }}</span></td>
+                            <td><span class="ticker-cell">{{ setup.symbol }}</span></td>
+                            <td><span class="live-pulse"></span><span class="num">${{ "{:,.2f}".format(setup.live_price) }}</span></td>
+                            <td><span class="num num-accent">${{ "{:,.2f}".format(setup.target) }}</span></td>
+                            <td>{% if setup.tp1 %}<span class="num pl-green">${{ "{:,.2f}".format(setup.tp1) }}</span>{% else %}<span class="num-sub">—</span>{% endif %}</td>
+                            <td><span class="num">${{ "{:.2f}".format(setup.atr) }}</span> <span class="num-sub">({{ "{:.1f}".format(setup.atr_pct) }}%)</span></td>
+                            <td><span class="{% if setup.dist >= 0 %}pl-green{% else %}pl-red{% endif %} mono">{{ "{:+.2f}".format(setup.dist) }}%</span></td>
+                            <td><span class="pill pill-grey">{{ setup.age_label }}</span></td>
+                            <td class="text-end">
+                                <form action="/toggle-ignore/{{ setup.symbol }}" method="POST" style="margin: 0;">
+                                    <button class="btn-pro {% if setup.ignored %}btn-pro-warn{% else %}btn-pro-outline{% endif %}">{% if setup.ignored %}Enable{% else %}Block{% endif %}</button>
+                                </form>
+                            </td>
+                        </tr>
+                        {% else %}
+                        <tr><td colspan="10" style="text-align: center; color: var(--text-2); font-style: italic; padding: 30px;">No setups detected. Click Force Scan to refresh.</td></tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-lg-4">
+        <div class="term-card">
+            <div class="term-header">
+                <div class="strat-title"><span class="live-pulse"></span>Broker Activity Log</div>
+                <div class="strat-tag">Last 50 system actions</div>
+            </div>
+            <div class="term-body">
+                {% for log in state.recent_actions %}
+                <div class="term-line"><span class="term-time">[{{ log.time }}]</span>{{ log.message }}</div>
+                {% endfor %}
+            </div>
+        </div>
+    </div>
+</div>
+
+</div> <!-- /app-shell -->
+
+<!-- ============================================================== -->
+<!-- GLOBAL PANIC MODAL                                              -->
+<!-- ============================================================== -->
+<div class="modal fade" id="globalPanicModal" tabindex="-1">
+    <div class="modal-dialog"><div class="modal-content">
+        <div class="modal-header" style="border-color: var(--red);">
+            <h5 class="modal-title" style="color: var(--red);">DANGER · Global Liquidation</h5>
+            <button class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+            <p>This will immediately market-sell <b>EVERY POSITION</b> across <b>ALL STRATEGIES</b> and cancel every limit order.</p>
+            <p style="text-align: center; margin: 18px 0;">Type <b style="background: var(--red); color: white; padding: 2px 8px; border-radius: 3px;">LIQUIDATE</b> to confirm</p>
+            <input type="text" id="panicInput" class="form-control text-center" onkeyup="validatePanic()" placeholder="Type LIQUIDATE">
+            <form action="/liquidate-all" method="POST" style="margin-top: 16px;">
+                <button type="submit" id="panicConfirmBtn" class="btn-pro btn-pro-danger w-100" disabled style="padding: 12px;">NUKE EVERYTHING AT MARKET</button>
+            </form>
+        </div>
+    </div></div>
+</div>
+
+</body>
+</html>

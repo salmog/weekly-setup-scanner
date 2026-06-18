@@ -25,7 +25,7 @@ from dotenv import load_dotenv
 import pandas as pd
 import numpy as np
 
-from fastapi import FastAPI, Request, Form, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
@@ -42,10 +42,6 @@ from alpaca.data.requests import StockLatestTradeRequest, StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 from strategy_state_logger import StrategyStateLogger
-from learning_engine import LearningEngine
-from multi_tf_manager import MultiTFDataManager
-from vix_monitor import VIXMonitor
-from model_router import ModelRouter
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -191,33 +187,9 @@ STRATEGY_SPECS = {
 # Display order in dashboard (top-to-bottom, left-to-right)
 STRATEGY_ORDER = ["S1_Salmog3_Weekly", "S2_WickScaled", "S3_4H_Hybrid", "S1_BodyStrict", "S4_TQQQ_Regime", "S5_TQQQ_Regime_B"]
 
-# ── State Logger + Learning Engine ────────────────────────────────────────────
+# ── State Logger ──────────────────────────────────────────────────────────────
 _STATE_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output", "strategy_state.db")
-state_logger    = StrategyStateLogger(db_path=_STATE_DB)
-learning_engine = LearningEngine(db_path=_STATE_DB)
-tf_manager      = MultiTFDataManager(data_dir=HISTORICAL_DATA_DIR, db_path=_STATE_DB)
-vix_monitor     = VIXMonitor(alpaca_client=None)   # data_client wired in startup_event
-model_router    = ModelRouter(db_path=_STATE_DB)
-
-# Register spike callback — logs to dashboard broker log and emits VIX_BLOCK events
-def _on_vix_spike(event: dict) -> None:
-    log_system_action(
-        f"[VIX_SPIKE] {event['interval']}: ^VIX={event['current_vix']:.1f} "
-        f"({event['change_pct']:+.1f}% over 15 candles) → composite={event['composite']}"
-    )
-vix_monitor.subscribe_to_spikes(_on_vix_spike)
-
-
-def run_weekly_learning():
-    """Scheduled batch: re-run mechanical analysis for every strategy."""
-    try:
-        results = learning_engine.run_all_strategies()
-        n_alerts = sum(1 for r in results.values() if r.get("drift_alert") or r.get("flip_suggestion"))
-        log_system_action(
-            f"[LEARNING] Weekly analysis complete: {len(results)} strategies, {n_alerts} alerts."
-        )
-    except Exception as e:
-        log_system_action(f"[LEARNING] Weekly analysis failed: {str(e)[:80]}")
+state_logger = StrategyStateLogger(db_path=_STATE_DB)
 
 # Routing: setup type label → account name
 TARGET_MAP = {
@@ -239,13 +211,6 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"],
 )
 templates = Jinja2Templates(directory="templates")
-
-# Serve React frontend static assets (JS/CSS bundles from vite build)
-_FE_DIST = "/root/MITLoop/frontend/dist"
-_fe_assets = os.path.join(_FE_DIST, "assets")
-if os.path.isdir(_fe_assets):
-    from fastapi.staticfiles import StaticFiles as _SF
-    app.mount("/assets", _SF(directory=_fe_assets), name="fe-assets")
 
 
 # ============================================================================
@@ -338,17 +303,6 @@ def log_system_action(message: str):
 def _cond(name: str, threshold, actual, met) -> dict:
     """Build a single condition dict for StrategyStateLogger snapshots."""
     return {"name": name, "threshold": threshold, "actual": actual, "met": bool(met)}
-
-
-def _sync_vix_monitor_to_state() -> None:
-    """
-    Push the latest VIX monitor reading into system_state["vix"] so the
-    existing dashboard template sees the richer data without changes.
-    """
-    try:
-        system_state["vix"].update(vix_monitor.to_system_state_dict())
-    except Exception:
-        pass
 
 
 def get_ignored_tickers():
@@ -471,8 +425,7 @@ def find_daily_pivot_lows(df_d, lookback=60):
 
 def update_account_states():
     check_market_hours()
-    update_vix()                        # legacy: keeps system_state["vix"] simple dict
-    _sync_vix_monitor_to_state()        # enriches it with composite + regime
+    update_vix()
     update_ibkr_health()
     tz = zoneinfo.ZoneInfo("America/New_York")
     now = datetime.datetime.now(tz)
@@ -1015,45 +968,12 @@ def run_daily_scan():
     system_state["pending_setups"] = discovered_setups
 
     # ============================================================
-    # ── VIX gate: suppress new longs on extreme fear ─────────────────────────
-    _vix_composite = vix_monitor.get_vix_status().get("composite", "CAUTION")
-    if _vix_composite == "RISK_OFF":
-        log_system_action(
-            f"[VIX_BLOCK] Scan routing blocked — composite=RISK_OFF, "
-            f"^VIX={vix_monitor.current_vix()}, regime={vix_monitor.current_regime()}"
-        )
-        system_state["scanner_status"] = "Monitoring active portfolios."
-        system_state["last_scan_duration_s"] = round(time.time() - scan_start, 1)
-        return
-
     # Route triggered setups to broker
     # ============================================================
     local_buying_power = {
         s: float(system_state["accounts"][s]["buying_power"]) if s in system_state["accounts"] else 0.0
         for s in clients
     }
-
-    # Load live HITL settings once — all gates default OFF if not yet accepted
-    _live_cfg = {
-        s: {
-            "patternpy_gate":       state_logger.get_live_setting(s, "patternpy_gate", 0),
-            "patternpy_stop":       state_logger.get_live_setting(s, "patternpy_stop", 0),
-            "multitf_gate":         state_logger.get_live_setting(s, "multitf_gate", 0),
-            "multitf_risk_block":   state_logger.get_live_setting(s, "multitf_risk_block", "none"),
-            "multitf_align_require":state_logger.get_live_setting(s, "multitf_align_require", "none"),
-            "ml_enabled":           state_logger.get_live_setting(s, "ml_enabled", 0),
-            "ml_threshold":         state_logger.get_live_setting(s, "ml_threshold", 1.0),
-        }
-        for s in clients
-    }
-
-    # PatternPY primary TF map per strategy
-    _strat_tf = {
-        "S1_Salmog3_Weekly": "1W", "S2_WickScaled": "1W",
-        "S3_4H_Hybrid": "4H", "S1_BodyStrict": "1H",
-        "S4_TQQQ_Regime": "1min", "S5_TQQQ_Regime_B": "1min",
-    }
-
     system_state["scanner_status"] = "Routing live triggers..."
 
     for setup in discovered_setups:
@@ -1070,69 +990,9 @@ def run_daily_scan():
                 if not acct_data:
                     continue
 
-                cfg = _live_cfg.get(strat_name, {})
-
-                # ── PatternPY gate (runs only when accepted via HITL) ─────────
-                _pat = {}
-                try:
-                    from pattern_detector import get_detector as _gd
-                    _pat = _gd().detect_for_symbol(
-                        setup["symbol"], _strat_tf.get(strat_name, "1W")
-                    )
-                except Exception:
-                    pass
-                state_logger.log_pattern_detection(
-                    setup["symbol"], _strat_tf.get(strat_name, "1W"), _pat, trade_triggered=False
-                )
-                if cfg.get("patternpy_gate") and _pat.get("pattern_bias") == "BEARISH":
-                    log_system_action(
-                        f"[PATTERNPY_GATE] {strat_name}: {setup['symbol']} blocked — "
-                        f"bias=BEARISH patterns={_pat.get('active_patterns', [])}"
-                    )
-                    continue
-
-                # ── MultiTF gate (runs only when accepted via HITL) ───────────
-                _mtf_alignment = "MIXED"
-                _mtf_risk = "NORMAL"
-                try:
-                    _mtf_primary = _strat_tf.get(strat_name, "1W")
-                    _mtf = tf_manager.get_multi_tf_status(
-                        setup["symbol"], _mtf_primary, persist=True
-                    )
-                    _mtf_alignment = _mtf.get("lower_tf_alignment", "MIXED")
-                    _mtf_risk      = _mtf.get("risk_level", "NORMAL")
-                except Exception:
-                    pass
-                if cfg.get("multitf_gate"):
-                    risk_block = cfg.get("multitf_risk_block", "none")
-                    align_req  = cfg.get("multitf_align_require", "none")
-                    if risk_block != "none" and _mtf_risk == risk_block:
-                        log_system_action(
-                            f"[MULTITF_GATE] {strat_name}: {setup['symbol']} blocked — "
-                            f"risk={_mtf_risk} (threshold={risk_block})"
-                        )
-                        continue
-                    if align_req == "BULLISH" and _mtf_alignment != "BULLISH":
-                        log_system_action(
-                            f"[MULTITF_GATE] {strat_name}: {setup['symbol']} blocked — "
-                            f"alignment={_mtf_alignment} (requires BULLISH)"
-                        )
-                        continue
-
                 risk_pct = 0.01
                 usable_capital = min(acct_data["equity"] * 0.10, local_buying_power[strat_name])
-
-                # ── Stop loss: PatternPY structural or ATR fallback ───────────
-                if cfg.get("patternpy_stop") and _pat.get("support_level"):
-                    _s = float(_pat["support_level"])
-                    _atr_fallback = setup["target"] - (1.0 * setup["atr"])
-                    if _s < setup["target"] and _s > _atr_fallback:
-                        stop_loss_px = _s - (0.25 * setup["atr"])
-                    else:
-                        stop_loss_px = _atr_fallback
-                else:
-                    stop_loss_px = setup["target"] - (1.0 * setup["atr"])
-
+                stop_loss_px = setup["target"] - (1.0 * setup["atr"])
                 risk_per_share = setup["target"] - stop_loss_px
 
                 if risk_per_share <= 0:
@@ -1387,15 +1247,6 @@ def run_tqqq_scalp():
         return
     if now.hour < 9 or (now.hour == 9 and now.minute < 46):
         return
-
-    # ── VIX gate: block new scalp entries when risk is elevated ──────────────
-    if vix_monitor.is_risk_off():
-        log_system_action(
-            f"[VIX_BLOCK] TQQQ scalp blocked — composite=RISK_OFF, "
-            f"^VIX={vix_monitor.current_vix()}, regime={vix_monitor.current_regime()}"
-        )
-        return
-
     df = fetch_tqqq_1m_bars(lookback_minutes=60)
     if df is None or len(df) < 20:
         return
@@ -1599,8 +1450,6 @@ scheduler.add_job(detect_tqqq_regime, 'cron', day_of_week='mon-fri', hour=9, min
 scheduler.add_job(run_tqqq_scalp, 'interval', minutes=1)
 scheduler.add_job(manage_tqqq_position, 'interval', minutes=1)
 scheduler.add_job(force_flat_tqqq, 'cron', day_of_week='mon-fri', hour=15, minute=50, timezone='US/Eastern')
-scheduler.add_job(run_weekly_learning, 'cron', day_of_week='sun', hour=22, minute=0, timezone='US/Eastern')
-scheduler.add_job(vix_monitor.update, 'interval', minutes=1, id='vix_update')
 scheduler.start()
 
 
@@ -1608,24 +1457,10 @@ scheduler.start()
 # FASTAPI ROUTES
 # ============================================================================
 
-@app.get("/legacy", response_class=HTMLResponse)
-async def legacy_dashboard(request: Request):
-    """Original Jinja2 dashboard — kept at /legacy for reference."""
+@app.get("/", response_class=HTMLResponse)
+async def dashboard(request: Request):
     update_account_states()
     return templates.TemplateResponse(request, "dashboard.html", {"state": system_state})
-
-
-@app.get("/", response_class=HTMLResponse)
-async def serve_react(request: Request):
-    """Serve React SPA. No-cache so browsers always fetch the freshest bundle hash."""
-    _idx = os.path.join(_FE_DIST, "index.html")
-    if os.path.exists(_idx):
-        return HTMLResponse(
-            open(_idx).read(),
-            headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-                     "Pragma": "no-cache", "Expires": "0"},
-        )
-    return RedirectResponse(url="/legacy")
 
 
 @app.post("/scan")
@@ -1776,20 +1611,7 @@ async def ibkr_health():
 
 @app.get("/api/vix")
 async def vix_data():
-    """Legacy endpoint — basic VIX dict for dashboard compatibility."""
     return system_state.get("vix", {})
-
-
-@app.get("/api/vix/status")
-async def vix_full_status():
-    """Full multi-interval VIX status: 1min, 5min, 15min + composite signal."""
-    return vix_monitor.get_vix_status()
-
-
-@app.post("/api/vix/refresh")
-async def vix_force_refresh():
-    """Force a fresh VIX fetch outside the 1-minute scheduler cadence."""
-    return vix_monitor.update()
 
 
 @app.get("/api/state")
@@ -1820,399 +1642,6 @@ async def api_trades(strategy_id: str):
         return {"error": str(e)}
 
 
-# ─── Learning Engine endpoints (mechanical analysis only — no live AI) ────────
-
-@app.get("/api/learning/{strategy_id}")
-async def api_learning_strategy(strategy_id: str):
-    """Latest mechanical analysis for one strategy (cached from last run)."""
-    latest = learning_engine.get_latest_insights(strategy_id)
-    if latest is None:
-        return {"status": "no_analysis_yet", "strategy_id": strategy_id}
-    return latest
-
-
-@app.get("/api/learning")
-async def api_learning_all():
-    """Latest mechanical analysis for every strategy."""
-    return {sid: learning_engine.get_latest_insights(sid) for sid in STRATEGY_ORDER}
-
-
-@app.get("/api/patterns/{symbol}/{timeframe}")
-async def api_patterns(symbol: str, timeframe: str):
-    """PatternPy detection for one symbol + timeframe — used by React PatternOverlay."""
-    from pattern_detector import get_detector
-    det = get_detector()
-    result = det.detect_for_symbol(symbol.upper(), timeframe.upper())
-    result["symbol"] = symbol.upper()
-    result["timeframe"] = timeframe.upper()
-    return result
-
-
-@app.get("/api/prices/{symbol}/{timeframe}")
-async def api_prices(symbol: str, timeframe: str, bars: int = 60):
-    """Last N OHLCV bars for the React price chart."""
-    tf_file_map = {
-        "1M": "monthly", "1W": "weekly", "1D": "daily",
-        "4H": "4h", "1H": "hourly", "30MIN": "30min",
-        "15MIN": "15min", "5MIN": "5min", "1MIN": "1min",
-    }
-    suffix = tf_file_map.get(timeframe.upper())
-    if not suffix:
-        return {"error": f"unknown timeframe: {timeframe}"}
-    path = os.path.join(HISTORICAL_DATA_DIR, f"{symbol.upper()}_{suffix}.csv")
-    if not os.path.exists(path):
-        return {"error": "no_data", "symbol": symbol.upper(), "timeframe": timeframe.upper(), "prices": []}
-    try:
-        df = pd.read_csv(path)
-        df.columns = df.columns.str.lower()
-        for col in ("open", "high", "low", "close"):
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        df = df.dropna(subset=["close"]).sort_values("date").tail(bars)
-        records = []
-        for _, row in df.iterrows():
-            records.append({
-                "date": str(row["date"])[:10],
-                "open": round(float(row["open"]), 2),
-                "high": round(float(row["high"]), 2),
-                "low": round(float(row["low"]), 2),
-                "close": round(float(row["close"]), 2),
-                "volume": int(row.get("volume", 0) or 0),
-            })
-        return {"symbol": symbol.upper(), "timeframe": timeframe.upper(), "prices": records}
-    except Exception as e:
-        return {"error": str(e), "prices": []}
-
-
-@app.post("/api/learning/run")
-async def api_learning_run():
-    """Force a fresh analysis run (rather than reading cached results)."""
-    return learning_engine.run_all_strategies()
-
-
-@app.get("/api/multi-tf/{symbol}/{primary_tf}")
-async def api_multi_tf(symbol: str, primary_tf: str, persist: bool = False):
-    """
-    Live multi-TF S/R + trend analysis for a symbol.
-    primary_tf examples: 1W, 1D, 4H, 1H
-    persist=true writes result to multi_tf_snapshots table.
-    """
-    return tf_manager.get_multi_tf_status(
-        symbol.upper(), primary_tf.upper(), persist=persist
-    )
-
-
-@app.get("/api/multi-tf/{symbol}/{primary_tf}/latest")
-async def api_multi_tf_latest(symbol: str, primary_tf: str):
-    """Return the last persisted multi-TF snapshot for a symbol."""
-    result = tf_manager.get_latest_snapshot(symbol.upper(), primary_tf.upper())
-    if result is None:
-        return {"status": "no_snapshot", "symbol": symbol, "primary_tf": primary_tf}
-    return result
-
-
-@app.get("/api/learning/{strategy_id}/history")
-async def api_learning_history(strategy_id: str, limit: int = 5):
-    """Last N analysis runs for one strategy (for the history accordion)."""
-    try:
-        conn = learning_engine._connect()
-        rows = conn.execute(
-            """
-            SELECT analysis_date, trades_analyzed, win_rate_20, drift_alert,
-                   flip_suggestion, recommendations_json
-            FROM strategy_insights
-            WHERE strategy_id = ?
-            ORDER BY id DESC LIMIT ?
-            """,
-            (strategy_id, limit),
-        ).fetchall()
-        conn.close()
-        out = []
-        for r in rows:
-            d = dict(r)
-            d["drift_alert"]     = bool(d["drift_alert"])
-            d["flip_suggestion"] = bool(d["flip_suggestion"])
-            d["recommendations"] = json.loads(d["recommendations_json"]) if d["recommendations_json"] else []
-            d.pop("recommendations_json", None)
-            out.append(d)
-        return out
-    except Exception as e:
-        return {"error": str(e)}
-
-
-# ============================================================================
-# HITL — Human-in-the-Loop endpoints
-# ============================================================================
-
-@app.get("/api/changes")
-async def get_all_changes(strategy_id: str = None):
-    """Return all pending proposed changes, optionally filtered by strategy."""
-    return state_logger.get_pending_changes(strategy_id)
-
-
-@app.get("/api/changes/history")
-async def get_change_history(strategy_id: str = None, limit: int = 100):
-    """Return decided (accepted/rejected) changes."""
-    return state_logger.get_change_history(strategy_id, limit)
-
-
-@app.post("/api/changes/{proposal_id}/accept")
-async def accept_change(proposal_id: int):
-    ok = state_logger.apply_change(proposal_id, decided_by="human")
-    if ok:
-        log_system_action(f"[HITL] Proposal #{proposal_id} accepted by human.")
-    return {"ok": ok, "proposal_id": proposal_id}
-
-
-@app.post("/api/changes/{proposal_id}/reject")
-async def reject_change(proposal_id: int):
-    ok = state_logger.reject_change(proposal_id)
-    if ok:
-        log_system_action(f"[HITL] Proposal #{proposal_id} rejected.")
-    return {"ok": ok, "proposal_id": proposal_id}
-
-
-@app.get("/api/settings")
-async def get_all_settings():
-    """Return current live parameters for all strategies."""
-    return state_logger.get_all_settings()
-
-
-@app.get("/api/settings/{strategy_id}")
-async def get_strategy_settings(strategy_id: str):
-    """Return live parameters for one strategy."""
-    rows = state_logger.get_all_settings()
-    match = next((r for r in rows if r["strategy_id"] == strategy_id), None)
-    if match is None:
-        return {"error": "strategy not found"}
-    return match
-
-
-@app.post("/api/settings/{strategy_id}/auto-accept")
-async def toggle_auto_accept(strategy_id: str, enabled: bool = False):
-    ok = state_logger.set_auto_accept(strategy_id, enabled)
-    if ok:
-        state = "ENABLED" if enabled else "DISABLED"
-        log_system_action(f"[HITL] Auto-accept {state} for {strategy_id}.")
-    return {"ok": ok, "strategy_id": strategy_id, "auto_accept": enabled}
-
-
-@app.get("/api/patterns/detections")
-async def get_pattern_detections(symbol: str = None, timeframe: str = None,
-                                  approved: int = None, limit: int = 100):
-    """Return PatternPY detection history with optional filters."""
-    try:
-        conn = state_logger._connect()
-        query = "SELECT * FROM pattern_detections WHERE 1=1"
-        params = []
-        if symbol:
-            query += " AND symbol = ?"
-            params.append(symbol.upper())
-        if timeframe:
-            query += " AND timeframe = ?"
-            params.append(timeframe.upper())
-        if approved is not None:
-            query += " AND approved = ?"
-            params.append(approved)
-        query += " ORDER BY detected_at DESC LIMIT ?"
-        params.append(limit)
-        rows = conn.execute(query, params).fetchall()
-        conn.close()
-        return [dict(r) for r in rows]
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@app.post("/api/patterns/detections/{detection_id}/approve")
-async def approve_detection(detection_id: int, notes: str = ""):
-    try:
-        conn = state_logger._connect()
-        conn.execute(
-            "UPDATE pattern_detections SET approved=1, notes=? WHERE id=?",
-            (notes, detection_id)
-        )
-        conn.commit()
-        conn.close()
-        return {"ok": True}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@app.post("/api/patterns/detections/{detection_id}/reject")
-async def reject_detection(detection_id: int, notes: str = ""):
-    try:
-        conn = state_logger._connect()
-        conn.execute(
-            "UPDATE pattern_detections SET approved=0, notes=? WHERE id=?",
-            (notes, detection_id)
-        )
-        conn.commit()
-        conn.close()
-        return {"ok": True}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@app.get("/api/patterns/stats")
-async def get_pattern_stats():
-    """Success rate per pattern type from approved detections with known outcomes."""
-    try:
-        conn = state_logger._connect()
-        rows = conn.execute("""
-            SELECT pattern_bias, COUNT(*) as total,
-                   SUM(CASE WHEN trade_outcome > 0 THEN 1 ELSE 0 END) as wins,
-                   AVG(trade_outcome) as avg_outcome
-            FROM pattern_detections
-            WHERE trade_outcome IS NOT NULL
-            GROUP BY pattern_bias
-        """).fetchall()
-        conn.close()
-        return [dict(r) for r in rows]
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@app.get("/api/patterns/scan/{symbol}/{timeframe}")
-async def scan_patterns_historical(symbol: str, timeframe: str,
-                                    start: str = "", end: str = "",
-                                    window: int = 100, changes_only: bool = False):
-    """
-    Run PatternPY across a historical date range. Returns candles + detections.
-    changes_only=true: only emit a detection when bias or active_patterns SET changes.
-    This reduces noise from patterns that persist across many bars.
-    """
-    from pattern_detector import get_detector
-    tf_map = {"1M": "monthly", "1W": "weekly", "1D": "daily",
-              "4H": "4h", "1H": "hourly", "30MIN": "30min",
-              "15MIN": "15min", "5MIN": "5min", "1MIN": "1min"}
-    suffix = tf_map.get(timeframe.upper())
-    if not suffix:
-        return {"error": f"unknown timeframe: {timeframe}"}
-    path = os.path.join(HISTORICAL_DATA_DIR, f"{symbol.upper()}_{suffix}.csv")
-    if not os.path.exists(path):
-        return {"error": "no_data", "prices": [], "detections": []}
-    try:
-        df_full = pd.read_csv(path)
-        df_full.columns = df_full.columns.str.lower()
-        for col in ("open", "high", "low", "close"):
-            df_full[col] = pd.to_numeric(df_full[col], errors="coerce")
-        df_full = df_full.dropna(subset=["close"]).sort_values("date").reset_index(drop=True)
-
-        # Keep `window` bars before `start` as context for rolling calculations,
-        # then filter the return set to the requested date range only.
-        start_idx = 0
-        if start:
-            start_idx = df_full[df_full["date"] >= start].index.min()
-            if pd.isna(start_idx):
-                return {"error": "no data in range", "prices": [], "detections": []}
-            start_idx = max(0, int(start_idx) - window)  # include context bars
-
-        df = df_full.iloc[start_idx:].copy()
-        if end:
-            df = df[df["date"] <= end]
-        df = df.reset_index(drop=True)
-
-        # Effective window: at least 10 bars, at most what we have minus 1
-        eff_window = max(10, min(window, len(df) - 1))
-
-        det = get_detector()
-        detections = []
-        in_range_start = start if start else ""
-
-        for i in range(eff_window, len(df)):
-            row = df.iloc[i]
-            # Skip bars before the requested start (they were context only)
-            if in_range_start and str(row["date"])[:10] < in_range_start:
-                continue
-            window_df = df.iloc[max(0, i - eff_window):i + 1]
-            pat = det.detect_all(window_df, lookback=eff_window)
-            if pat["active_patterns"] or pat["support_level"] or pat["resistance_level"]:
-                detections.append({
-                    "date":              str(row["date"])[:10],
-                    "close":             round(float(row["close"]), 2),
-                    "pattern_bias":      pat["pattern_bias"],
-                    "active_patterns":   pat["active_patterns"],
-                    "support_level":     pat["support_level"],
-                    "resistance_level":  pat["resistance_level"],
-                    "head_shoulder":     pat["head_shoulder"],
-                    "double":            pat["double"],
-                    "triangle":          pat["triangle"],
-                    "wedge":             pat["wedge"],
-                    "channel":           pat["channel"],
-                })
-
-        # Deduplicate: only emit when bias OR pattern set actually changes.
-        # S/R levels drift continuously — ignore them for transition detection.
-        if changes_only and detections:
-            filtered = [detections[0]]
-            for det in detections[1:]:
-                prev = filtered[-1]
-                bias_changed = det["pattern_bias"] != prev["pattern_bias"]
-                set_changed  = set(det["active_patterns"]) != set(prev["active_patterns"])
-                if bias_changed or set_changed:
-                    filtered.append(det)
-            detections = filtered
-
-        # Return only the requested date range for prices
-        df_out = df_full.copy()
-        if start:
-            df_out = df_out[df_out["date"] >= start]
-        if end:
-            df_out = df_out[df_out["date"] <= end]
-
-        prices = [
-            {"date": str(r["date"])[:10], "open": round(float(r["open"]), 2),
-             "high": round(float(r["high"]), 2), "low": round(float(r["low"]), 2),
-             "close": round(float(r["close"]), 2), "volume": int(r.get("volume", 0) or 0)}
-            for _, r in df_out.iterrows()
-        ]
-        return {"symbol": symbol.upper(), "timeframe": timeframe.upper(),
-                "prices": prices, "detections": detections,
-                "window_used": eff_window, "total_bars_with_context": len(df)}
-    except Exception as e:
-        return {"error": str(e), "prices": [], "detections": []}
-
-
-# ============================================================================
-# WebSocket — live state push to React frontend
-# ============================================================================
-
-_ws_clients: list[WebSocket] = []
-
-
-@app.websocket("/ws")
-async def websocket_live(websocket: WebSocket):
-    """Push system_state to connected React clients every 5 seconds."""
-    await websocket.accept()
-    _ws_clients.append(websocket)
-    try:
-        while True:
-            await asyncio.sleep(5)
-            try:
-                await websocket.send_json(system_state)
-            except Exception:
-                break
-    except WebSocketDisconnect:
-        pass
-    finally:
-        if websocket in _ws_clients:
-            _ws_clients.remove(websocket)
-
-
-async def _broadcast_state():
-    """Called after account state updates to push immediately to all clients."""
-    dead = []
-    for ws in list(_ws_clients):
-        try:
-            await ws.send_json(system_state)
-        except Exception:
-            dead.append(ws)
-    for ws in dead:
-        if ws in _ws_clients:
-            _ws_clients.remove(ws)
-
-
 @app.on_event("startup")
 async def startup_event():
-    vix_monitor._alpaca_client = data_client   # wire Alpaca client now that it exists
-    state_logger.bootstrap_settings(STRATEGY_ORDER)  # ensure HITL settings rows exist
     update_account_states()

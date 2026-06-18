@@ -15,7 +15,6 @@ Strategies:
 
 import os
 import math
-import json
 import logging
 import datetime
 import zoneinfo
@@ -25,7 +24,7 @@ from dotenv import load_dotenv
 import pandas as pd
 import numpy as np
 
-from fastapi import FastAPI, Request, Form, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
@@ -41,12 +40,6 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestTradeRequest, StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
-from strategy_state_logger import StrategyStateLogger
-from learning_engine import LearningEngine
-from multi_tf_manager import MultiTFDataManager
-from vix_monitor import VIXMonitor
-from model_router import ModelRouter
-
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -58,8 +51,6 @@ logger = logging.getLogger(__name__)
 
 HISTORICAL_DATA_DIR = "/home/shay/autotrade_dev/fetch_candles_ibkr/historical_data/"
 IGNORED_TICKERS_FILE = "/root/MITLoop/mit-loop-live/ignored_tickers.txt"
-IBKR_HEALTH_FILE = "/home/shay/autotrade_dev/fetch_candles_ibkr/state/health.json"
-IBKR_TICKER_FILE = "/home/shay/autotrade_dev/fetch_candles_ibkr/tickers2344.csv"
 
 # Trigger envelope: how close to target before placing the limit order
 ENVELOPE_PCT = 0.02   # 2%
@@ -191,34 +182,6 @@ STRATEGY_SPECS = {
 # Display order in dashboard (top-to-bottom, left-to-right)
 STRATEGY_ORDER = ["S1_Salmog3_Weekly", "S2_WickScaled", "S3_4H_Hybrid", "S1_BodyStrict", "S4_TQQQ_Regime", "S5_TQQQ_Regime_B"]
 
-# ── State Logger + Learning Engine ────────────────────────────────────────────
-_STATE_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output", "strategy_state.db")
-state_logger    = StrategyStateLogger(db_path=_STATE_DB)
-learning_engine = LearningEngine(db_path=_STATE_DB)
-tf_manager      = MultiTFDataManager(data_dir=HISTORICAL_DATA_DIR, db_path=_STATE_DB)
-vix_monitor     = VIXMonitor(alpaca_client=None)   # data_client wired in startup_event
-model_router    = ModelRouter(db_path=_STATE_DB)
-
-# Register spike callback — logs to dashboard broker log and emits VIX_BLOCK events
-def _on_vix_spike(event: dict) -> None:
-    log_system_action(
-        f"[VIX_SPIKE] {event['interval']}: ^VIX={event['current_vix']:.1f} "
-        f"({event['change_pct']:+.1f}% over 15 candles) → composite={event['composite']}"
-    )
-vix_monitor.subscribe_to_spikes(_on_vix_spike)
-
-
-def run_weekly_learning():
-    """Scheduled batch: re-run mechanical analysis for every strategy."""
-    try:
-        results = learning_engine.run_all_strategies()
-        n_alerts = sum(1 for r in results.values() if r.get("drift_alert") or r.get("flip_suggestion"))
-        log_system_action(
-            f"[LEARNING] Weekly analysis complete: {len(results)} strategies, {n_alerts} alerts."
-        )
-    except Exception as e:
-        log_system_action(f"[LEARNING] Weekly analysis failed: {str(e)[:80]}")
-
 # Routing: setup type label → account name
 TARGET_MAP = {
     "S1_Salmog3_Weekly": "SALMOG3",
@@ -239,13 +202,6 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"],
 )
 templates = Jinja2Templates(directory="templates")
-
-# Serve React frontend static assets (JS/CSS bundles from vite build)
-_FE_DIST = "/root/MITLoop/frontend/dist"
-_fe_assets = os.path.join(_FE_DIST, "assets")
-if os.path.isdir(_fe_assets):
-    from fastapi.staticfiles import StaticFiles as _SF
-    app.mount("/assets", _SF(directory=_fe_assets), name="fe-assets")
 
 
 # ============================================================================
@@ -300,24 +256,19 @@ system_state = {
     "last_scan_duration_s": 0.0,
     "scan_count_today": 0,
     "market_status": "Checking...",
-    "market_phase": "unknown",     # premarket, open, afterhours, closed
     "scanner_status": "Operational",
     "margin_limits": {k: 0.0 for k in clients},
     "scheduled_liquidations": {k: None for k in clients},
-    "paused_strategies": {k: False for k in clients},  # pause = no new trades, manage existing
     "accounts": {},
     "pending_setups": [],
-    "s4_regime": None,
+    "s4_regime": None,       # today's regime: TREND_UP, TREND_DOWN, CHOPPY
     "s4_orb_high": 0.0,
     "s4_orb_low": 0.0,
-    "vix": {"current": None, "change_pct": None, "level": "unknown", "last_update": None},
-    "ibkr_health": {},             # loaded from health.json
-    "ibkr_ticker_count": 0,
     "strategy_specs": STRATEGY_SPECS,
     "strategy_order": STRATEGY_ORDER,
     "recent_actions": [{
         "time": datetime.datetime.now().strftime("%H:%M:%S"),
-        "message": "Live Engine online. 6 strategies armed.",
+        "message": "Live Engine online. 5 strategies armed (4 swing + 1 intraday).",
     }],
 }
 
@@ -333,22 +284,6 @@ def log_system_action(message: str):
     })
     if len(system_state["recent_actions"]) > 50:
         system_state["recent_actions"].pop()
-
-
-def _cond(name: str, threshold, actual, met) -> dict:
-    """Build a single condition dict for StrategyStateLogger snapshots."""
-    return {"name": name, "threshold": threshold, "actual": actual, "met": bool(met)}
-
-
-def _sync_vix_monitor_to_state() -> None:
-    """
-    Push the latest VIX monitor reading into system_state["vix"] so the
-    existing dashboard template sees the richer data without changes.
-    """
-    try:
-        system_state["vix"].update(vix_monitor.to_system_state_dict())
-    except Exception:
-        pass
 
 
 def get_ignored_tickers():
@@ -384,64 +319,10 @@ def check_market_hours():
     now = datetime.datetime.now(tz)
     if now.weekday() >= 5:
         system_state["market_status"] = "CLOSED (Weekend)"
-        system_state["market_phase"] = "closed"
         return
-    pre_open = now.replace(hour=4, minute=0, second=0, microsecond=0)
     market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
     market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
-    after_close = now.replace(hour=20, minute=0, second=0, microsecond=0)
-    if market_open <= now <= market_close:
-        system_state["market_status"] = "OPEN (Live Session)"
-        system_state["market_phase"] = "open"
-    elif pre_open <= now < market_open:
-        system_state["market_status"] = "PRE-MARKET"
-        system_state["market_phase"] = "premarket"
-    elif market_close < now <= after_close:
-        system_state["market_status"] = "AFTER-HOURS"
-        system_state["market_phase"] = "afterhours"
-    else:
-        system_state["market_status"] = "CLOSED (Off-Hours)"
-        system_state["market_phase"] = "closed"
-
-
-def update_vix():
-    """Fetch current VIX from Alpaca and classify regime level."""
-    try:
-        req = StockLatestTradeRequest(symbol_or_symbols="VIXY")
-        trades = data_client.get_stock_latest_trade(req)
-        if "VIXY" in trades:
-            price = float(trades["VIXY"].price)
-            # VIXY is a VIX proxy ETF — classify the fear level
-            if price > 30:
-                level = "EXTREME_FEAR"
-            elif price > 22:
-                level = "HIGH"
-            elif price > 16:
-                level = "ELEVATED"
-            else:
-                level = "LOW"
-            system_state["vix"] = {
-                "current": round(price, 2),
-                "level": level,
-                "last_update": datetime.datetime.utcnow().isoformat(),
-            }
-    except Exception:
-        pass
-
-
-def update_ibkr_health():
-    """Read the IBKR fetch service health file for dashboard display."""
-    try:
-        if os.path.exists(IBKR_HEALTH_FILE):
-            with open(IBKR_HEALTH_FILE, 'r') as f:
-                system_state["ibkr_health"] = json.load(f)
-        if os.path.exists(IBKR_TICKER_FILE):
-            import csv
-            with open(IBKR_TICKER_FILE, 'r') as f:
-                reader = csv.reader(f)
-                system_state["ibkr_ticker_count"] = sum(1 for _ in reader) - 1
-    except Exception:
-        pass
+    system_state["market_status"] = "OPEN (Live Session)" if market_open <= now <= market_close else "CLOSED (Off-Hours)"
 
 
 def calculate_wilders_atr(df, period=14):
@@ -471,9 +352,6 @@ def find_daily_pivot_lows(df_d, lookback=60):
 
 def update_account_states():
     check_market_hours()
-    update_vix()                        # legacy: keeps system_state["vix"] simple dict
-    _sync_vix_monitor_to_state()        # enriches it with composite + regime
-    update_ibkr_health()
     tz = zoneinfo.ZoneInfo("America/New_York")
     now = datetime.datetime.now(tz)
 
@@ -762,21 +640,6 @@ def run_daily_scan():
                             "breakout_vol": float(breakout_vol),
                             "atr": float(daily_atr),
                         })
-                        prelim_setups[-1]["_conditions"] = [
-                            _cond("trend_aligned_ema20_sma50", "above", "above" if row['ema20'] > row['sma50'] else "below", row['ema20'] > row['sma50']),
-                            _cond("ema_sloping_up_4w", "rising", "rising" if len(recent_df) >= 5 and row['ema20'] > recent_df.iloc[-5]['ema20'] else "flat", len(recent_df) >= 5 and row['ema20'] > recent_df.iloc[-5]['ema20']),
-                            _cond("liquid_price_min_5usd", 5.0, round(float(row['close']), 2), row['close'] >= 5.0),
-                            _cond("liquid_dollar_volume_5M", 5_000_000, round(float(row['close'] * row['vol_avg']), 0), row['close'] * row['vol_avg'] >= 5_000_000),
-                            _cond("breakout_above_wick_resistance", round(float(trigger_level), 2), round(float(row['close']), 2), True),
-                            _cond("breakout_volume_2_5x_avg", 2.5, round(float(breakout_vol / row['vol_avg']), 2) if row['vol_avg'] > 0 else 0.0, True),
-                            _cond("not_extended_ema20_x125", 1.25, round(float(row['close'] / row['ema20']), 3) if row['ema20'] > 0 else 999.0, row['close'] <= row['ema20'] * 1.25),
-                            _cond("held_above_breakout_level_4w", 4, int(weeks_above), weeks_above >= 4),
-                        ]
-                        prelim_setups[-1]["_ohlcv"] = {
-                            "open": float(row.get('open', 0)), "high": float(row.get('high', 0)),
-                            "low": float(row.get('low', 0)), "close": float(row['close']),
-                            "volume": float(row['volume']),
-                        }
 
             # ============================================================
             # S1_Salmog3_Weekly — weekly body retest with pivot TP
@@ -828,24 +691,6 @@ def run_daily_scan():
                                 "breakout_vol": float(breakout_vol),
                                 "atr": float(daily_atr),
                             })
-                            _sma30 = float(current_row['sma30']) if pd.notna(current_row.get('sma30')) else 1.0
-                            prelim_setups[-1]["_conditions"] = [
-                                _cond("macro_bull_above_sma30", 1.0, round(float(row['close'] / _sma30), 3) if _sma30 > 0 else 0.0, row['close'] > _sma30),
-                                _cond("trend_aligned_ema20_sma50", "above", "above" if row['ema20'] > row['sma50'] else "below", row['ema20'] > row['sma50']),
-                                _cond("ema_sloping_up_4w", "rising", "rising" if len(recent_df) >= 5 and row['ema20'] > recent_df.iloc[-5]['ema20'] else "flat", len(recent_df) >= 5 and row['ema20'] > recent_df.iloc[-5]['ema20']),
-                                _cond("liquid_price_min_5usd", 5.0, round(float(row['close']), 2), row['close'] >= 5.0),
-                                _cond("liquid_dollar_volume_5M", 5_000_000, round(float(row['close'] * row['vol_avg']), 0), row['close'] * row['vol_avg'] >= 5_000_000),
-                                _cond("breakout_above_body_resistance", round(float(trigger_level), 2), round(float(row['close']), 2), True),
-                                _cond("breakout_volume_2_5x_avg", 2.5, round(float(breakout_vol / row['vol_avg']), 2) if row['vol_avg'] > 0 else 0.0, True),
-                                _cond("not_extended_ema20_x125", 1.25, round(float(row['close'] / row['ema20']), 3) if row['ema20'] > 0 else 999.0, row['close'] <= row['ema20'] * 1.25),
-                                _cond("held_above_breakout_level_4w", 4, int(weeks_above), weeks_above >= 4),
-                                _cond("low_pullback_volume", "<breakout", round(float(row['volume'] / breakout_vol), 2) if breakout_vol > 0 else 0.0, row['volume'] < breakout_vol),
-                            ]
-                            prelim_setups[-1]["_ohlcv"] = {
-                                "open": float(row.get('open', 0)), "high": float(row.get('high', 0)),
-                                "low": float(row.get('low', 0)), "close": float(row['close']),
-                                "volume": float(row['volume']),
-                            }
 
             # ============================================================
             # S1_BodyStrict — 1H V-Shape capitulation
@@ -884,18 +729,6 @@ def run_daily_scan():
                                 "breakout_vol": 0.0,
                                 "atr": float(daily_atr),
                             })
-                            _w_sma30 = float(df_w['sma30'].iloc[-1]) if pd.notna(df_w['sma30'].iloc[-1]) else 1.0
-                            prelim_setups[-1]["_conditions"] = [
-                                _cond("above_sma30_floor_85pct", 0.85, round(float(current_row['close'] / _w_sma30), 3) if _w_sma30 > 0 else 0.0, current_row['close'] >= _w_sma30 * 0.85),
-                                _cond("drawdown_10_to_30pct", [0.10, 0.30], round(float(drawdown), 4), 0.10 <= drawdown <= 0.30),
-                                _cond("exhaustion_tail_gte_2pct", 0.02, round(float(best_bar['tail_size']), 4), float(best_bar['tail_size']) > 0.02),
-                                _cond("cycle_high_defined", "6m_high", round(float(cycle_high), 2), cycle_high > 0),
-                            ]
-                            prelim_setups[-1]["_ohlcv"] = {
-                                "open": float(best_bar.get('open', 0)), "high": float(best_bar.get('high', 0)),
-                                "low": float(best_bar['low']), "close": float(recent_1h.iloc[-1]['close']),
-                                "volume": float(recent_1h.iloc[-1].get('volume', 0)),
-                            }
 
             # ============================================================
             # S3_4H_Hybrid — 4H breakout-retest dual-leg
@@ -940,20 +773,6 @@ def run_daily_scan():
                                             "breakout_vol": float(breakout_bar['volume']),
                                             "atr": float(daily_atr),
                                         })
-                                        _w_sma30_s3 = float(df_w['sma30'].iloc[-1]) if pd.notna(df_w['sma30'].iloc[-1]) else 1.0
-                                        _bo_vol_avg = float(breakout_bar['vol_avg']) if breakout_bar['vol_avg'] > 0 else 1.0
-                                        prelim_setups[-1]["_conditions"] = [
-                                            _cond("weekly_quality_above_sma30_85pct", 0.85, round(float(current_row['close'] / _w_sma30_s3), 3) if _w_sma30_s3 > 0 else 0.0, current_row['close'] >= _w_sma30_s3 * 0.85),
-                                            _cond("4h_trend_ema20_above_ema50", "above", "above" if current_4h['ema20'] > current_4h['ema50'] else "below", current_4h['ema20'] > current_4h['ema50']),
-                                            _cond("held_above_breakout_level_4h_bars", 4, int(held_bars), held_bars >= 4),
-                                            _cond("breakout_volume_1_2x_avg", 1.2, round(float(breakout_bar['volume'] / _bo_vol_avg), 2), breakout_bar['volume'] > breakout_bar['vol_avg'] * 1.2),
-                                            _cond("retest_proximity_0_to_5pct", 0.05, round(float(dist), 4), 0 <= dist <= 0.05),
-                                        ]
-                                        prelim_setups[-1]["_ohlcv"] = {
-                                            "open": float(current_4h.get('open', 0)), "high": float(current_4h.get('high', 0)),
-                                            "low": float(current_4h.get('low', 0)), "close": float(current_4h['close']),
-                                            "volume": float(current_4h['volume']),
-                                        }
         except Exception:
             continue
 
@@ -1015,45 +834,12 @@ def run_daily_scan():
     system_state["pending_setups"] = discovered_setups
 
     # ============================================================
-    # ── VIX gate: suppress new longs on extreme fear ─────────────────────────
-    _vix_composite = vix_monitor.get_vix_status().get("composite", "CAUTION")
-    if _vix_composite == "RISK_OFF":
-        log_system_action(
-            f"[VIX_BLOCK] Scan routing blocked — composite=RISK_OFF, "
-            f"^VIX={vix_monitor.current_vix()}, regime={vix_monitor.current_regime()}"
-        )
-        system_state["scanner_status"] = "Monitoring active portfolios."
-        system_state["last_scan_duration_s"] = round(time.time() - scan_start, 1)
-        return
-
     # Route triggered setups to broker
     # ============================================================
     local_buying_power = {
         s: float(system_state["accounts"][s]["buying_power"]) if s in system_state["accounts"] else 0.0
         for s in clients
     }
-
-    # Load live HITL settings once — all gates default OFF if not yet accepted
-    _live_cfg = {
-        s: {
-            "patternpy_gate":       state_logger.get_live_setting(s, "patternpy_gate", 0),
-            "patternpy_stop":       state_logger.get_live_setting(s, "patternpy_stop", 0),
-            "multitf_gate":         state_logger.get_live_setting(s, "multitf_gate", 0),
-            "multitf_risk_block":   state_logger.get_live_setting(s, "multitf_risk_block", "none"),
-            "multitf_align_require":state_logger.get_live_setting(s, "multitf_align_require", "none"),
-            "ml_enabled":           state_logger.get_live_setting(s, "ml_enabled", 0),
-            "ml_threshold":         state_logger.get_live_setting(s, "ml_threshold", 1.0),
-        }
-        for s in clients
-    }
-
-    # PatternPY primary TF map per strategy
-    _strat_tf = {
-        "S1_Salmog3_Weekly": "1W", "S2_WickScaled": "1W",
-        "S3_4H_Hybrid": "4H", "S1_BodyStrict": "1H",
-        "S4_TQQQ_Regime": "1min", "S5_TQQQ_Regime_B": "1min",
-    }
-
     system_state["scanner_status"] = "Routing live triggers..."
 
     for setup in discovered_setups:
@@ -1063,76 +849,14 @@ def run_daily_scan():
         for strat_name, client in clients.items():
             if setup["type"] != TARGET_MAP.get(strat_name):
                 continue
-            if system_state["paused_strategies"].get(strat_name, False):
-                continue
             try:
                 acct_data = system_state["accounts"].get(strat_name)
                 if not acct_data:
                     continue
 
-                cfg = _live_cfg.get(strat_name, {})
-
-                # ── PatternPY gate (runs only when accepted via HITL) ─────────
-                _pat = {}
-                try:
-                    from pattern_detector import get_detector as _gd
-                    _pat = _gd().detect_for_symbol(
-                        setup["symbol"], _strat_tf.get(strat_name, "1W")
-                    )
-                except Exception:
-                    pass
-                state_logger.log_pattern_detection(
-                    setup["symbol"], _strat_tf.get(strat_name, "1W"), _pat, trade_triggered=False
-                )
-                if cfg.get("patternpy_gate") and _pat.get("pattern_bias") == "BEARISH":
-                    log_system_action(
-                        f"[PATTERNPY_GATE] {strat_name}: {setup['symbol']} blocked — "
-                        f"bias=BEARISH patterns={_pat.get('active_patterns', [])}"
-                    )
-                    continue
-
-                # ── MultiTF gate (runs only when accepted via HITL) ───────────
-                _mtf_alignment = "MIXED"
-                _mtf_risk = "NORMAL"
-                try:
-                    _mtf_primary = _strat_tf.get(strat_name, "1W")
-                    _mtf = tf_manager.get_multi_tf_status(
-                        setup["symbol"], _mtf_primary, persist=True
-                    )
-                    _mtf_alignment = _mtf.get("lower_tf_alignment", "MIXED")
-                    _mtf_risk      = _mtf.get("risk_level", "NORMAL")
-                except Exception:
-                    pass
-                if cfg.get("multitf_gate"):
-                    risk_block = cfg.get("multitf_risk_block", "none")
-                    align_req  = cfg.get("multitf_align_require", "none")
-                    if risk_block != "none" and _mtf_risk == risk_block:
-                        log_system_action(
-                            f"[MULTITF_GATE] {strat_name}: {setup['symbol']} blocked — "
-                            f"risk={_mtf_risk} (threshold={risk_block})"
-                        )
-                        continue
-                    if align_req == "BULLISH" and _mtf_alignment != "BULLISH":
-                        log_system_action(
-                            f"[MULTITF_GATE] {strat_name}: {setup['symbol']} blocked — "
-                            f"alignment={_mtf_alignment} (requires BULLISH)"
-                        )
-                        continue
-
                 risk_pct = 0.01
                 usable_capital = min(acct_data["equity"] * 0.10, local_buying_power[strat_name])
-
-                # ── Stop loss: PatternPY structural or ATR fallback ───────────
-                if cfg.get("patternpy_stop") and _pat.get("support_level"):
-                    _s = float(_pat["support_level"])
-                    _atr_fallback = setup["target"] - (1.0 * setup["atr"])
-                    if _s < setup["target"] and _s > _atr_fallback:
-                        stop_loss_px = _s - (0.25 * setup["atr"])
-                    else:
-                        stop_loss_px = _atr_fallback
-                else:
-                    stop_loss_px = setup["target"] - (1.0 * setup["atr"])
-
+                stop_loss_px = setup["target"] - (1.0 * setup["atr"])
                 risk_per_share = setup["target"] - stop_loss_px
 
                 if risk_per_share <= 0:
@@ -1161,18 +885,6 @@ def run_daily_scan():
                         stop_loss=StopLossRequest(stop_price=round(stop_loss_px, 2)),
                     ))
                     log_system_action(f"[S3] DUAL-LEG: {shares}x {setup['symbol']} @ ${setup['target']:.2f}, TP +2R @ ${tp1_px:.2f}")
-                    _entry_snap = state_logger.on_candle(
-                        strategy_id=strat_name, symbol=setup["symbol"], timeframe="4H",
-                        ohlcv=setup.get("_ohlcv", {"open": 0, "high": 0, "low": 0, "close": setup["live_price"], "volume": setup.get("csv_vol", 0)}),
-                        conditions=setup.get("_conditions", []),
-                        pattern_signals={"support_level": round(stop_loss_px, 2), "resistance_level": round(tp1_px, 2)},
-                        trade_triggered=True,
-                    )
-                    state_logger.on_trade_entry(
-                        entry_snapshot_id=_entry_snap, strategy_id=strat_name,
-                        symbol=setup["symbol"], direction="LONG",
-                        entry_time=datetime.datetime.utcnow(), entry_price=setup["target"],
-                    )
 
                 elif strat_name == "S1_Salmog3_Weekly" and shares >= 2 and setup.get("tp1"):
                     half = shares // 2
@@ -1190,18 +902,6 @@ def run_daily_scan():
                         stop_loss=StopLossRequest(stop_price=round(stop_loss_px, 2)),
                     ))
                     log_system_action(f"[Salmog3] DUAL-LEG: {shares}x {setup['symbol']} @ ${setup['target']:.2f}, TP @ ${tp1_px:.2f} (next pivot), runner trails daily pivots")
-                    _entry_snap = state_logger.on_candle(
-                        strategy_id=strat_name, symbol=setup["symbol"], timeframe="1W",
-                        ohlcv=setup.get("_ohlcv", {"open": 0, "high": 0, "low": 0, "close": setup["live_price"], "volume": setup.get("csv_vol", 0)}),
-                        conditions=setup.get("_conditions", []),
-                        pattern_signals={"support_level": round(stop_loss_px, 2), "resistance_level": round(float(tp1_px), 2)},
-                        trade_triggered=True,
-                    )
-                    state_logger.on_trade_entry(
-                        entry_snapshot_id=_entry_snap, strategy_id=strat_name,
-                        symbol=setup["symbol"], direction="LONG",
-                        entry_time=datetime.datetime.utcnow(), entry_price=setup["target"],
-                    )
 
                 else:
                     client.submit_order(LimitOrderRequest(
@@ -1210,19 +910,6 @@ def run_daily_scan():
                         stop_loss=StopLossRequest(stop_price=round(stop_loss_px, 2)),
                     ))
                     log_system_action(f"[{strat_name}] ENTRY: {shares}x {setup['symbol']} @ ${setup['target']:.2f}")
-                    _tf = {"S2_WickScaled": "1W", "S1_BodyStrict": "1H"}.get(strat_name, "1W")
-                    _entry_snap = state_logger.on_candle(
-                        strategy_id=strat_name, symbol=setup["symbol"], timeframe=_tf,
-                        ohlcv=setup.get("_ohlcv", {"open": 0, "high": 0, "low": 0, "close": setup["live_price"], "volume": setup.get("csv_vol", 0)}),
-                        conditions=setup.get("_conditions", []),
-                        pattern_signals={"support_level": round(stop_loss_px, 2), "resistance_level": None},
-                        trade_triggered=True,
-                    )
-                    state_logger.on_trade_entry(
-                        entry_snapshot_id=_entry_snap, strategy_id=strat_name,
-                        symbol=setup["symbol"], direction="LONG",
-                        entry_time=datetime.datetime.utcnow(), entry_price=setup["target"],
-                    )
 
                 local_buying_power[strat_name] -= total_cost
                 setup["actionable"] = False
@@ -1352,25 +1039,6 @@ def _tqqq_enter_trend_hold(entry_price, stop_price):
             log_system_action(
                 f"[{acct_name}] TREND HOLD: {shares}x @ ~${entry_price:.2f} | Stop: ORB low ${stop_price:.2f}"
             )
-            _orb_high = system_state.get("s4_orb_high", entry_price)
-            _entry_snap = state_logger.on_candle(
-                strategy_id=acct_name, symbol=S4_SYMBOL, timeframe="1min",
-                ohlcv={"open": stop_price, "high": _orb_high, "low": stop_price, "close": entry_price, "volume": 0},
-                conditions=[
-                    _cond("regime_trend_up", "TREND_UP", system_state.get("s4_regime"), True),
-                    _cond("orb_direction_positive", 0.003, round((entry_price - stop_price) / stop_price, 4) if stop_price > 0 else 0.0, True),
-                    _cond("orb_range_sufficient", 0.005, round((_orb_high - stop_price) / stop_price, 4) if stop_price > 0 else 0.0, True),
-                    _cond("no_existing_position", False, False, True),
-                    _cond("sufficient_buying_power", 1, int(shares), shares >= 1),
-                ],
-                pattern_signals={"support_level": round(stop_price, 2), "resistance_level": round(_orb_high, 2)},
-                trade_triggered=True,
-            )
-            state_logger.on_trade_entry(
-                entry_snapshot_id=_entry_snap, strategy_id=acct_name,
-                symbol=S4_SYMBOL, direction="LONG",
-                entry_time=datetime.datetime.utcnow(), entry_price=float(entry_price),
-            )
         except Exception as e:
             log_system_action(f"[{acct_name}] Trend entry failed: {str(e)[:80]}")
 
@@ -1387,15 +1055,6 @@ def run_tqqq_scalp():
         return
     if now.hour < 9 or (now.hour == 9 and now.minute < 46):
         return
-
-    # ── VIX gate: block new scalp entries when risk is elevated ──────────────
-    if vix_monitor.is_risk_off():
-        log_system_action(
-            f"[VIX_BLOCK] TQQQ scalp blocked — composite=RISK_OFF, "
-            f"^VIX={vix_monitor.current_vix()}, regime={vix_monitor.current_regime()}"
-        )
-        return
-
     df = fetch_tqqq_1m_bars(lookback_minutes=60)
     if df is None or len(df) < 20:
         return
@@ -1408,28 +1067,6 @@ def run_tqqq_scalp():
     vwap_dist = (current['close'] - current['vwap']) / current['vwap'] if current['vwap'] > 0 else 0
     is_oversold = current['rsi'] < S4_RSI_OVERSOLD or vwap_dist < -0.015
     is_green = current['close'] > current['open']
-
-    # ── Per-candle snapshot (every 1-min bar, regardless of entry) ──────────
-    _scalp_conditions = [
-        _cond("regime_choppy", "CHOPPY", system_state.get("s4_regime"), True),
-        _cond("rsi_oversold", S4_RSI_OVERSOLD, round(float(current['rsi']), 1), bool(current['rsi'] < S4_RSI_OVERSOLD)),
-        _cond("below_vwap_or_deep_dip", -0.015, round(float(vwap_dist), 4), bool(is_oversold)),
-        _cond("green_candle_absorption", "green", "green" if is_green else "red", is_green),
-        _cond("all_entry_conditions_met", True, bool(is_oversold and is_green), bool(is_oversold and is_green)),
-    ]
-    _scalp_ohlcv = {
-        "open": float(current['open']), "high": float(current['high']),
-        "low": float(current['low']), "close": float(current['close']),
-        "volume": float(current['volume']),
-    }
-    _scalp_snap = state_logger.on_candle(
-        strategy_id="S4_TQQQ_Regime", symbol=S4_SYMBOL, timeframe="1min",
-        ohlcv=_scalp_ohlcv, conditions=_scalp_conditions,
-        pattern_signals={"vwap": round(float(current['vwap']), 2), "rsi": round(float(current['rsi']), 1)},
-        trade_triggered=bool(is_oversold and is_green),
-    )
-    # ────────────────────────────────────────────────────────────────────────
-
     if not (is_oversold and is_green):
         return
     stop = current['close'] - 1.5 * current['atr']
@@ -1455,11 +1092,6 @@ def run_tqqq_scalp():
             log_system_action(
                 f"[{acct_name}] SCALP: {shares}x @ ${current['close']:.2f} | "
                 f"RSI={current['rsi']:.0f} VWAP={vwap_dist*100:.2f}%"
-            )
-            state_logger.on_trade_entry(
-                entry_snapshot_id=_scalp_snap, strategy_id=acct_name,
-                symbol=S4_SYMBOL, direction="LONG",
-                entry_time=datetime.datetime.utcnow(), entry_price=float(current['close']),
             )
         except Exception as e:
             log_system_action(f"[{acct_name}] Scalp entry failed: {str(e)[:80]}")
@@ -1537,20 +1169,6 @@ def manage_tqqq_position():
                 log_system_action(
                     f"[{acct_name}] EXIT {qty}sh @ ~${current_price:.2f} | P&L: {pnl_pct*100:+.2f}% | {exit_reason}"
                 )
-                _exit_conds = [
-                    _cond("exit_triggered", "exit_reason", exit_reason, True),
-                    _cond("pnl_at_exit_pct", 0, round(pnl_pct * 100, 2), pnl_pct > 0),
-                ]
-                _exit_snap = state_logger.on_candle(
-                    strategy_id=acct_name, symbol=S4_SYMBOL, timeframe="1min",
-                    ohlcv={"open": entry, "high": current_price, "low": current_price, "close": current_price, "volume": 0},
-                    conditions=_exit_conds, trade_triggered=False,
-                )
-                _open_tid = state_logger.get_open_trade_id(acct_name, S4_SYMBOL)
-                state_logger.on_trade_exit(
-                    trade_id=_open_tid or "", exit_snapshot_id=_exit_snap,
-                    exit_time=datetime.datetime.utcnow(), exit_price=float(current_price),
-                )
             except Exception as e:
                 log_system_action(f"[{acct_name}] Exit failed: {str(e)[:80]}")
 
@@ -1560,29 +1178,8 @@ def force_flat_tqqq():
     for acct_name in TQQQ_ACCOUNTS:
         try:
             client = clients[acct_name]
-            _open_tid = state_logger.get_open_trade_id(acct_name, S4_SYMBOL)
-            # Fetch current price before closing
-            _exit_price = 0.0
-            try:
-                for p in client.get_all_positions():
-                    if p.symbol == S4_SYMBOL:
-                        _exit_price = float(p.current_price)
-                        break
-            except Exception:
-                pass
             client.close_all_positions(cancel_orders=True)
             log_system_action(f"[{acct_name}] 15:50 ET FORCE FLAT -- no overnight.")
-            if _open_tid and _exit_price > 0:
-                _flat_snap = state_logger.on_candle(
-                    strategy_id=acct_name, symbol=S4_SYMBOL, timeframe="1min",
-                    ohlcv={"open": 0, "high": 0, "low": 0, "close": _exit_price, "volume": 0},
-                    conditions=[_cond("force_flat_15_50_et", "15:50", "15:50", True)],
-                    trade_triggered=False,
-                )
-                state_logger.on_trade_exit(
-                    trade_id=_open_tid, exit_snapshot_id=_flat_snap,
-                    exit_time=datetime.datetime.utcnow(), exit_price=_exit_price,
-                )
         except Exception as e:
             log_system_action(f"[{acct_name}] Force flat failed: {str(e)[:80]}")
     system_state["s4_regime"] = None
@@ -1599,8 +1196,6 @@ scheduler.add_job(detect_tqqq_regime, 'cron', day_of_week='mon-fri', hour=9, min
 scheduler.add_job(run_tqqq_scalp, 'interval', minutes=1)
 scheduler.add_job(manage_tqqq_position, 'interval', minutes=1)
 scheduler.add_job(force_flat_tqqq, 'cron', day_of_week='mon-fri', hour=15, minute=50, timezone='US/Eastern')
-scheduler.add_job(run_weekly_learning, 'cron', day_of_week='sun', hour=22, minute=0, timezone='US/Eastern')
-scheduler.add_job(vix_monitor.update, 'interval', minutes=1, id='vix_update')
 scheduler.start()
 
 
@@ -1608,24 +1203,10 @@ scheduler.start()
 # FASTAPI ROUTES
 # ============================================================================
 
-@app.get("/legacy", response_class=HTMLResponse)
-async def legacy_dashboard(request: Request):
-    """Original Jinja2 dashboard — kept at /legacy for reference."""
+@app.get("/", response_class=HTMLResponse)
+async def dashboard(request: Request):
     update_account_states()
     return templates.TemplateResponse(request, "dashboard.html", {"state": system_state})
-
-
-@app.get("/", response_class=HTMLResponse)
-async def serve_react(request: Request):
-    """Serve React SPA. No-cache so browsers always fetch the freshest bundle hash."""
-    _idx = os.path.join(_FE_DIST, "index.html")
-    if os.path.exists(_idx):
-        return HTMLResponse(
-            open(_idx).read(),
-            headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-                     "Pragma": "no-cache", "Expires": "0"},
-        )
-    return RedirectResponse(url="/legacy")
 
 
 @app.post("/scan")
@@ -1744,475 +1325,6 @@ async def liquidate_all():
     return RedirectResponse(url="/", status_code=303)
 
 
-@app.post("/pause-strategy/{strat_name}")
-async def pause_strategy(strat_name: str):
-    if strat_name in system_state["paused_strategies"]:
-        is_paused = system_state["paused_strategies"][strat_name]
-        system_state["paused_strategies"][strat_name] = not is_paused
-        if not is_paused:
-            # Pausing: cancel all pending buy orders
-            try:
-                client = clients[strat_name]
-                for o in client.get_orders():
-                    if o.side == OrderSide.BUY:
-                        client.cancel_order_by_id(o.id)
-                log_system_action(f"[{strat_name}] PAUSED — all pending buys cancelled. Existing positions managed until closed.")
-            except Exception as e:
-                log_system_action(f"[{strat_name}] Pause failed: {str(e)[:80]}")
-        else:
-            log_system_action(f"[{strat_name}] RESUMED — scanning for new setups.")
-    return RedirectResponse(url="/", status_code=303)
-
-
-@app.get("/api/ibkr-health")
-async def ibkr_health():
-    """JSON endpoint for IBKR fetch service health (polled by dashboard)."""
-    update_ibkr_health()
-    return {
-        "ibkr_health": system_state.get("ibkr_health", {}),
-        "ticker_count": system_state.get("ibkr_ticker_count", 0),
-    }
-
-
-@app.get("/api/vix")
-async def vix_data():
-    """Legacy endpoint — basic VIX dict for dashboard compatibility."""
-    return system_state.get("vix", {})
-
-
-@app.get("/api/vix/status")
-async def vix_full_status():
-    """Full multi-interval VIX status: 1min, 5min, 15min + composite signal."""
-    return vix_monitor.get_vix_status()
-
-
-@app.post("/api/vix/refresh")
-async def vix_force_refresh():
-    """Force a fresh VIX fetch outside the 1-minute scheduler cadence."""
-    return vix_monitor.update()
-
-
-@app.get("/api/state")
-async def api_state():
-    """Full system state as JSON — for programmatic access / mobile app."""
-    return system_state
-
-
-@app.get("/api/snapshots/{strategy_id}")
-async def api_snapshots(strategy_id: str, hours: int = 24):
-    """Return all strategy snapshots for the last N hours (default 24)."""
-    since = datetime.datetime.utcnow() - datetime.timedelta(hours=hours)
-    return state_logger.get_snapshots_for_strategy(strategy_id, since)
-
-
-@app.get("/api/trades/{strategy_id}")
-async def api_trades(strategy_id: str):
-    """Return all trade_log rows for a strategy (open and closed)."""
-    try:
-        conn = state_logger._connect()
-        rows = conn.execute(
-            "SELECT * FROM trade_log WHERE strategy_id = ? ORDER BY entry_time DESC",
-            (strategy_id,),
-        ).fetchall()
-        conn.close()
-        return [dict(r) for r in rows]
-    except Exception as e:
-        return {"error": str(e)}
-
-
-# ─── Learning Engine endpoints (mechanical analysis only — no live AI) ────────
-
-@app.get("/api/learning/{strategy_id}")
-async def api_learning_strategy(strategy_id: str):
-    """Latest mechanical analysis for one strategy (cached from last run)."""
-    latest = learning_engine.get_latest_insights(strategy_id)
-    if latest is None:
-        return {"status": "no_analysis_yet", "strategy_id": strategy_id}
-    return latest
-
-
-@app.get("/api/learning")
-async def api_learning_all():
-    """Latest mechanical analysis for every strategy."""
-    return {sid: learning_engine.get_latest_insights(sid) for sid in STRATEGY_ORDER}
-
-
-@app.get("/api/patterns/{symbol}/{timeframe}")
-async def api_patterns(symbol: str, timeframe: str):
-    """PatternPy detection for one symbol + timeframe — used by React PatternOverlay."""
-    from pattern_detector import get_detector
-    det = get_detector()
-    result = det.detect_for_symbol(symbol.upper(), timeframe.upper())
-    result["symbol"] = symbol.upper()
-    result["timeframe"] = timeframe.upper()
-    return result
-
-
-@app.get("/api/prices/{symbol}/{timeframe}")
-async def api_prices(symbol: str, timeframe: str, bars: int = 60):
-    """Last N OHLCV bars for the React price chart."""
-    tf_file_map = {
-        "1M": "monthly", "1W": "weekly", "1D": "daily",
-        "4H": "4h", "1H": "hourly", "30MIN": "30min",
-        "15MIN": "15min", "5MIN": "5min", "1MIN": "1min",
-    }
-    suffix = tf_file_map.get(timeframe.upper())
-    if not suffix:
-        return {"error": f"unknown timeframe: {timeframe}"}
-    path = os.path.join(HISTORICAL_DATA_DIR, f"{symbol.upper()}_{suffix}.csv")
-    if not os.path.exists(path):
-        return {"error": "no_data", "symbol": symbol.upper(), "timeframe": timeframe.upper(), "prices": []}
-    try:
-        df = pd.read_csv(path)
-        df.columns = df.columns.str.lower()
-        for col in ("open", "high", "low", "close"):
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        df = df.dropna(subset=["close"]).sort_values("date").tail(bars)
-        records = []
-        for _, row in df.iterrows():
-            records.append({
-                "date": str(row["date"])[:10],
-                "open": round(float(row["open"]), 2),
-                "high": round(float(row["high"]), 2),
-                "low": round(float(row["low"]), 2),
-                "close": round(float(row["close"]), 2),
-                "volume": int(row.get("volume", 0) or 0),
-            })
-        return {"symbol": symbol.upper(), "timeframe": timeframe.upper(), "prices": records}
-    except Exception as e:
-        return {"error": str(e), "prices": []}
-
-
-@app.post("/api/learning/run")
-async def api_learning_run():
-    """Force a fresh analysis run (rather than reading cached results)."""
-    return learning_engine.run_all_strategies()
-
-
-@app.get("/api/multi-tf/{symbol}/{primary_tf}")
-async def api_multi_tf(symbol: str, primary_tf: str, persist: bool = False):
-    """
-    Live multi-TF S/R + trend analysis for a symbol.
-    primary_tf examples: 1W, 1D, 4H, 1H
-    persist=true writes result to multi_tf_snapshots table.
-    """
-    return tf_manager.get_multi_tf_status(
-        symbol.upper(), primary_tf.upper(), persist=persist
-    )
-
-
-@app.get("/api/multi-tf/{symbol}/{primary_tf}/latest")
-async def api_multi_tf_latest(symbol: str, primary_tf: str):
-    """Return the last persisted multi-TF snapshot for a symbol."""
-    result = tf_manager.get_latest_snapshot(symbol.upper(), primary_tf.upper())
-    if result is None:
-        return {"status": "no_snapshot", "symbol": symbol, "primary_tf": primary_tf}
-    return result
-
-
-@app.get("/api/learning/{strategy_id}/history")
-async def api_learning_history(strategy_id: str, limit: int = 5):
-    """Last N analysis runs for one strategy (for the history accordion)."""
-    try:
-        conn = learning_engine._connect()
-        rows = conn.execute(
-            """
-            SELECT analysis_date, trades_analyzed, win_rate_20, drift_alert,
-                   flip_suggestion, recommendations_json
-            FROM strategy_insights
-            WHERE strategy_id = ?
-            ORDER BY id DESC LIMIT ?
-            """,
-            (strategy_id, limit),
-        ).fetchall()
-        conn.close()
-        out = []
-        for r in rows:
-            d = dict(r)
-            d["drift_alert"]     = bool(d["drift_alert"])
-            d["flip_suggestion"] = bool(d["flip_suggestion"])
-            d["recommendations"] = json.loads(d["recommendations_json"]) if d["recommendations_json"] else []
-            d.pop("recommendations_json", None)
-            out.append(d)
-        return out
-    except Exception as e:
-        return {"error": str(e)}
-
-
-# ============================================================================
-# HITL — Human-in-the-Loop endpoints
-# ============================================================================
-
-@app.get("/api/changes")
-async def get_all_changes(strategy_id: str = None):
-    """Return all pending proposed changes, optionally filtered by strategy."""
-    return state_logger.get_pending_changes(strategy_id)
-
-
-@app.get("/api/changes/history")
-async def get_change_history(strategy_id: str = None, limit: int = 100):
-    """Return decided (accepted/rejected) changes."""
-    return state_logger.get_change_history(strategy_id, limit)
-
-
-@app.post("/api/changes/{proposal_id}/accept")
-async def accept_change(proposal_id: int):
-    ok = state_logger.apply_change(proposal_id, decided_by="human")
-    if ok:
-        log_system_action(f"[HITL] Proposal #{proposal_id} accepted by human.")
-    return {"ok": ok, "proposal_id": proposal_id}
-
-
-@app.post("/api/changes/{proposal_id}/reject")
-async def reject_change(proposal_id: int):
-    ok = state_logger.reject_change(proposal_id)
-    if ok:
-        log_system_action(f"[HITL] Proposal #{proposal_id} rejected.")
-    return {"ok": ok, "proposal_id": proposal_id}
-
-
-@app.get("/api/settings")
-async def get_all_settings():
-    """Return current live parameters for all strategies."""
-    return state_logger.get_all_settings()
-
-
-@app.get("/api/settings/{strategy_id}")
-async def get_strategy_settings(strategy_id: str):
-    """Return live parameters for one strategy."""
-    rows = state_logger.get_all_settings()
-    match = next((r for r in rows if r["strategy_id"] == strategy_id), None)
-    if match is None:
-        return {"error": "strategy not found"}
-    return match
-
-
-@app.post("/api/settings/{strategy_id}/auto-accept")
-async def toggle_auto_accept(strategy_id: str, enabled: bool = False):
-    ok = state_logger.set_auto_accept(strategy_id, enabled)
-    if ok:
-        state = "ENABLED" if enabled else "DISABLED"
-        log_system_action(f"[HITL] Auto-accept {state} for {strategy_id}.")
-    return {"ok": ok, "strategy_id": strategy_id, "auto_accept": enabled}
-
-
-@app.get("/api/patterns/detections")
-async def get_pattern_detections(symbol: str = None, timeframe: str = None,
-                                  approved: int = None, limit: int = 100):
-    """Return PatternPY detection history with optional filters."""
-    try:
-        conn = state_logger._connect()
-        query = "SELECT * FROM pattern_detections WHERE 1=1"
-        params = []
-        if symbol:
-            query += " AND symbol = ?"
-            params.append(symbol.upper())
-        if timeframe:
-            query += " AND timeframe = ?"
-            params.append(timeframe.upper())
-        if approved is not None:
-            query += " AND approved = ?"
-            params.append(approved)
-        query += " ORDER BY detected_at DESC LIMIT ?"
-        params.append(limit)
-        rows = conn.execute(query, params).fetchall()
-        conn.close()
-        return [dict(r) for r in rows]
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@app.post("/api/patterns/detections/{detection_id}/approve")
-async def approve_detection(detection_id: int, notes: str = ""):
-    try:
-        conn = state_logger._connect()
-        conn.execute(
-            "UPDATE pattern_detections SET approved=1, notes=? WHERE id=?",
-            (notes, detection_id)
-        )
-        conn.commit()
-        conn.close()
-        return {"ok": True}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@app.post("/api/patterns/detections/{detection_id}/reject")
-async def reject_detection(detection_id: int, notes: str = ""):
-    try:
-        conn = state_logger._connect()
-        conn.execute(
-            "UPDATE pattern_detections SET approved=0, notes=? WHERE id=?",
-            (notes, detection_id)
-        )
-        conn.commit()
-        conn.close()
-        return {"ok": True}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@app.get("/api/patterns/stats")
-async def get_pattern_stats():
-    """Success rate per pattern type from approved detections with known outcomes."""
-    try:
-        conn = state_logger._connect()
-        rows = conn.execute("""
-            SELECT pattern_bias, COUNT(*) as total,
-                   SUM(CASE WHEN trade_outcome > 0 THEN 1 ELSE 0 END) as wins,
-                   AVG(trade_outcome) as avg_outcome
-            FROM pattern_detections
-            WHERE trade_outcome IS NOT NULL
-            GROUP BY pattern_bias
-        """).fetchall()
-        conn.close()
-        return [dict(r) for r in rows]
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@app.get("/api/patterns/scan/{symbol}/{timeframe}")
-async def scan_patterns_historical(symbol: str, timeframe: str,
-                                    start: str = "", end: str = "",
-                                    window: int = 100, changes_only: bool = False):
-    """
-    Run PatternPY across a historical date range. Returns candles + detections.
-    changes_only=true: only emit a detection when bias or active_patterns SET changes.
-    This reduces noise from patterns that persist across many bars.
-    """
-    from pattern_detector import get_detector
-    tf_map = {"1M": "monthly", "1W": "weekly", "1D": "daily",
-              "4H": "4h", "1H": "hourly", "30MIN": "30min",
-              "15MIN": "15min", "5MIN": "5min", "1MIN": "1min"}
-    suffix = tf_map.get(timeframe.upper())
-    if not suffix:
-        return {"error": f"unknown timeframe: {timeframe}"}
-    path = os.path.join(HISTORICAL_DATA_DIR, f"{symbol.upper()}_{suffix}.csv")
-    if not os.path.exists(path):
-        return {"error": "no_data", "prices": [], "detections": []}
-    try:
-        df_full = pd.read_csv(path)
-        df_full.columns = df_full.columns.str.lower()
-        for col in ("open", "high", "low", "close"):
-            df_full[col] = pd.to_numeric(df_full[col], errors="coerce")
-        df_full = df_full.dropna(subset=["close"]).sort_values("date").reset_index(drop=True)
-
-        # Keep `window` bars before `start` as context for rolling calculations,
-        # then filter the return set to the requested date range only.
-        start_idx = 0
-        if start:
-            start_idx = df_full[df_full["date"] >= start].index.min()
-            if pd.isna(start_idx):
-                return {"error": "no data in range", "prices": [], "detections": []}
-            start_idx = max(0, int(start_idx) - window)  # include context bars
-
-        df = df_full.iloc[start_idx:].copy()
-        if end:
-            df = df[df["date"] <= end]
-        df = df.reset_index(drop=True)
-
-        # Effective window: at least 10 bars, at most what we have minus 1
-        eff_window = max(10, min(window, len(df) - 1))
-
-        det = get_detector()
-        detections = []
-        in_range_start = start if start else ""
-
-        for i in range(eff_window, len(df)):
-            row = df.iloc[i]
-            # Skip bars before the requested start (they were context only)
-            if in_range_start and str(row["date"])[:10] < in_range_start:
-                continue
-            window_df = df.iloc[max(0, i - eff_window):i + 1]
-            pat = det.detect_all(window_df, lookback=eff_window)
-            if pat["active_patterns"] or pat["support_level"] or pat["resistance_level"]:
-                detections.append({
-                    "date":              str(row["date"])[:10],
-                    "close":             round(float(row["close"]), 2),
-                    "pattern_bias":      pat["pattern_bias"],
-                    "active_patterns":   pat["active_patterns"],
-                    "support_level":     pat["support_level"],
-                    "resistance_level":  pat["resistance_level"],
-                    "head_shoulder":     pat["head_shoulder"],
-                    "double":            pat["double"],
-                    "triangle":          pat["triangle"],
-                    "wedge":             pat["wedge"],
-                    "channel":           pat["channel"],
-                })
-
-        # Deduplicate: only emit when bias OR pattern set actually changes.
-        # S/R levels drift continuously — ignore them for transition detection.
-        if changes_only and detections:
-            filtered = [detections[0]]
-            for det in detections[1:]:
-                prev = filtered[-1]
-                bias_changed = det["pattern_bias"] != prev["pattern_bias"]
-                set_changed  = set(det["active_patterns"]) != set(prev["active_patterns"])
-                if bias_changed or set_changed:
-                    filtered.append(det)
-            detections = filtered
-
-        # Return only the requested date range for prices
-        df_out = df_full.copy()
-        if start:
-            df_out = df_out[df_out["date"] >= start]
-        if end:
-            df_out = df_out[df_out["date"] <= end]
-
-        prices = [
-            {"date": str(r["date"])[:10], "open": round(float(r["open"]), 2),
-             "high": round(float(r["high"]), 2), "low": round(float(r["low"]), 2),
-             "close": round(float(r["close"]), 2), "volume": int(r.get("volume", 0) or 0)}
-            for _, r in df_out.iterrows()
-        ]
-        return {"symbol": symbol.upper(), "timeframe": timeframe.upper(),
-                "prices": prices, "detections": detections,
-                "window_used": eff_window, "total_bars_with_context": len(df)}
-    except Exception as e:
-        return {"error": str(e), "prices": [], "detections": []}
-
-
-# ============================================================================
-# WebSocket — live state push to React frontend
-# ============================================================================
-
-_ws_clients: list[WebSocket] = []
-
-
-@app.websocket("/ws")
-async def websocket_live(websocket: WebSocket):
-    """Push system_state to connected React clients every 5 seconds."""
-    await websocket.accept()
-    _ws_clients.append(websocket)
-    try:
-        while True:
-            await asyncio.sleep(5)
-            try:
-                await websocket.send_json(system_state)
-            except Exception:
-                break
-    except WebSocketDisconnect:
-        pass
-    finally:
-        if websocket in _ws_clients:
-            _ws_clients.remove(websocket)
-
-
-async def _broadcast_state():
-    """Called after account state updates to push immediately to all clients."""
-    dead = []
-    for ws in list(_ws_clients):
-        try:
-            await ws.send_json(system_state)
-        except Exception:
-            dead.append(ws)
-    for ws in dead:
-        if ws in _ws_clients:
-            _ws_clients.remove(ws)
-
-
 @app.on_event("startup")
 async def startup_event():
-    vix_monitor._alpaca_client = data_client   # wire Alpaca client now that it exists
-    state_logger.bootstrap_settings(STRATEGY_ORDER)  # ensure HITL settings rows exist
     update_account_states()
